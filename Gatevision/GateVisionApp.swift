@@ -61,12 +61,13 @@ struct OCRMode {
 
 final class Database {
     static let shared = Database()
-    private var db: OpaquePointer?
+    private(set) var rawDB: OpaquePointer?
+    private var db: OpaquePointer? { rawDB }
 
     private init() {
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("gatevision.sqlite")
-        if sqlite3_open(url.path, &db) == SQLITE_OK {
+        if sqlite3_open(url.path, &rawDB) == SQLITE_OK {
             createTables()
             seedDemo()
         }
@@ -173,6 +174,7 @@ final class Database {
         exec("DELETE FROM plates WHERE id=\(id)")
     }
 
+    @discardableResult
     func toggleBlock(id: Int64) -> Bool {
         exec("UPDATE plates SET blocked=CASE WHEN blocked=1 THEN 0 ELSE 1 END WHERE id=\(id)")
         var stmt: OpaquePointer?
@@ -257,6 +259,38 @@ final class Database {
 
 // MARK: - OCR + Camera Engine
 
+// MARK: - Lens Type
+
+enum LensType: String, CaseIterable, Identifiable {
+    case ultrawide = "ultrawide"
+    case wide      = "wide"
+    case telephoto = "telephoto"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .ultrawide: return "0.5×"
+        case .wide:      return "1×"
+        case .telephoto: return "2×"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .ultrawide: return "arrow.up.left.and.arrow.down.right"
+        case .wide:      return "camera"
+        case .telephoto: return "plus.magnifyingglass"
+        }
+    }
+    var deviceType: AVCaptureDevice.DeviceType {
+        switch self {
+        case .ultrawide: return .builtInUltraWideCamera
+        case .wide:      return .builtInWideAngleCamera
+        case .telephoto: return .builtInTelephotoCamera
+        }
+    }
+}
+
 final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var gateState: GateState = .closed
     @Published var lastPlate: String    = ""
@@ -265,7 +299,16 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     @Published var liveLog:   [LogEntry] = []
     @Published var freeTokens:[String]  = []
     @Published var cameraOK:  Bool      = false
-    @Published var ocrMode:   String    = OCRMode.plate
+    @Published var ocrMode: String = OCRMode.plate {
+        didSet { _ocrModeSafe = ocrMode }
+    }
+    // Thread-safe copy read from OCR queue without MainActor requirement
+    private var _ocrModeSafe: String = OCRMode.plate
+
+    @Published var selectedLens: LensType = .wide {
+        didSet { switchLens(to: selectedLens) }
+    }
+    @Published var availableLenses: [LensType] = []
 
     // Settings
     @Published var openDuration:  Double = 10
@@ -300,39 +343,67 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
     // MARK: Camera Setup
     private func setupCamera() {
+        // Detect available lenses
+        let allTypes: [LensType] = [.ultrawide, .wide, .telephoto]
+        let available = allTypes.filter {
+            AVCaptureDevice.default($0.deviceType, for: .video, position: .back) != nil
+        }
+        DispatchQueue.main.async { self.availableLenses = available }
+
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            self.session.beginConfiguration()
-            self.session.sessionPreset = .hd1280x720
+            self._startSession(lens: self.selectedLens)
+        }
+    }
 
-            guard
-                let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-                let input  = try? AVCaptureDeviceInput(device: device),
-                self.session.canAddInput(input)
-            else {
-                DispatchQueue.main.async { self.cameraOK = false }
-                return
-            }
+    private func _startSession(lens: LensType) {
+        session.beginConfiguration()
+        session.sessionPreset = .hd1280x720
 
-            // Auto-focus continuous
-            try? device.lockForConfiguration()
-            if device.isFocusModeSupported(.continuousAutoFocus) {
-                device.focusMode = .continuousAutoFocus
-            }
-            device.unlockForConfiguration()
+        // Remove existing inputs
+        session.inputs.forEach { session.removeInput($0) }
 
-            self.session.addInput(input)
-            self.videoOutput.setSampleBufferDelegate(self, queue: self.ocrQueue)
-            self.videoOutput.alwaysDiscardsLateVideoFrames = true
-            if self.session.canAddOutput(self.videoOutput) {
-                self.session.addOutput(self.videoOutput)
-            }
-            if let conn = self.videoOutput.connection(with: .video) {
-                conn.videoRotationAngle = 90  // Portrait
-            }
-            self.session.commitConfiguration()
-            self.session.startRunning()
-            DispatchQueue.main.async { self.cameraOK = true }
+        // Try requested lens, fall back to wide
+        let deviceType = lens.deviceType
+        let device = AVCaptureDevice.default(deviceType, for: .video, position: .back)
+                  ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+
+        guard let device,
+              let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input)
+        else {
+            session.commitConfiguration()
+            DispatchQueue.main.async { self.cameraOK = false }
+            return
+        }
+
+        // Auto-focus continuous
+        try? device.lockForConfiguration()
+        if device.isFocusModeSupported(.continuousAutoFocus) {
+            device.focusMode = .continuousAutoFocus
+        }
+        device.unlockForConfiguration()
+
+        session.addInput(input)
+
+        if !session.outputs.contains(videoOutput) {
+            videoOutput.setSampleBufferDelegate(self, queue: ocrQueue)
+            videoOutput.alwaysDiscardsLateVideoFrames = true
+            if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
+        }
+        if let conn = videoOutput.connection(with: .video) {
+            conn.videoRotationAngle = 90  // Portrait
+        }
+        session.commitConfiguration()
+        if !session.isRunning { session.startRunning() }
+        DispatchQueue.main.async { self.cameraOK = true }
+    }
+
+    func switchLens(to lens: LensType) {
+        ocrFrameCount = 0; fpsMeasureTs = Date()
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self._startSession(lens: lens)
         }
     }
 
@@ -366,7 +437,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 return (top.string, Double(top.confidence))
             }
 
-            if self.ocrMode == OCRMode.free {
+            if self._ocrModeSafe == OCRMode.free {
                 self.handleFreeMode(texts: texts)
             } else {
                 self.handlePlateMode(texts: texts)
@@ -713,17 +784,43 @@ struct StatusTab: View {
                         GV.bg2.frame(height: 60)
                     }
 
-                    Button {
-                        withAnimation { showCamera.toggle() }
-                    } label: {
-                        Image(systemName: showCamera ? "eye.slash" : "eye")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(GV.muted)
-                            .padding(8)
-                            .background(GV.bg2.opacity(0.8))
-                            .clipShape(Circle())
+                    VStack {
+                        HStack {
+                            // Lens switcher (only shown when camera visible and >1 lens)
+                            if showCamera && engine.availableLenses.count > 1 {
+                                HStack(spacing: 4) {
+                                    ForEach(engine.availableLenses) { lens in
+                                        Button {
+                                            withAnimation(.easeInOut(duration: 0.2)) {
+                                                engine.selectedLens = lens
+                                            }
+                                        } label: {
+                                            Text(lens.label)
+                                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                                .foregroundStyle(engine.selectedLens == lens ? GV.bg : GV.fg)
+                                                .padding(.horizontal, 9).padding(.vertical, 5)
+                                                .background(engine.selectedLens == lens ? GV.lime : GV.bg2.opacity(0.8))
+                                                .clipShape(Capsule())
+                                        }
+                                    }
+                                }
+                                .padding(8)
+                            }
+                            Spacer()
+                            Button {
+                                withAnimation { showCamera.toggle() }
+                            } label: {
+                                Image(systemName: showCamera ? "eye.slash" : "eye")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(GV.muted)
+                                    .padding(8)
+                                    .background(GV.bg2.opacity(0.8))
+                                    .clipShape(Circle())
+                            }
+                            .padding(10)
+                        }
+                        Spacer()
                     }
-                    .padding(10)
                 }
 
                 // Gate state — big
@@ -887,7 +984,7 @@ struct LogTab: View {
                     .foregroundStyle(GV.fg)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.characters)
-                    .onChange(of: query) { _ in loadLogs() }
+                    .onChange(of: query) { loadLogs() }
             }
             .padding(.horizontal, 12).padding(.vertical, 9)
             .background(GV.bg2)
@@ -1007,7 +1104,7 @@ struct PlatesTab: View {
                 TextField("Szukaj...", text: $query)
                     .font(.system(size: 14)).foregroundStyle(GV.fg)
                     .autocorrectionDisabled().textInputAutocapitalization(.characters)
-                    .onChange(of: query) { _ in load() }
+                    .onChange(of: query) { load() }
                 Spacer()
                 Button { showAdd = true } label: {
                     Image(systemName: "plus")
@@ -1175,27 +1272,39 @@ struct SettingsTab: View {
                 Form {
                     // OCR Mode
                     Section {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("TRYB OCR")
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundStyle(GV.muted)
-                            HStack(spacing: 10) {
-                                OcrModeBtn(
-                                    label: "🔍 TABLICA",
-                                    sub:   "Filtruje tablice rejestracyjne, otwiera bramę",
-                                    active: engine.ocrMode == OCRMode.plate,
-                                    color:  GV.purple
-                                ) { engine.ocrMode = OCRMode.plate }
-                                OcrModeBtn(
-                                    label: "📋 WOLNY",
-                                    sub:   "Cały tekst bez filtra — do kalibracji",
-                                    active: engine.ocrMode == OCRMode.free,
-                                    color:  GV.azure
-                                ) { engine.ocrMode = OCRMode.free }
-                            }
+                        Picker("Tryb OCR", selection: $engine.ocrMode) {
+                            Text("🔍 TABLICA").tag(OCRMode.plate)
+                            Text("📋 WOLNY").tag(OCRMode.free)
                         }
+                        .pickerStyle(.segmented)
                         .padding(.vertical, 4)
-                    } header: { Text("Silnik OCR") }
+
+                        if engine.ocrMode == OCRMode.plate {
+                            Text("Filtruje tablice rejestracyjne i otwiera bramę automatycznie.")
+                                .font(.system(size: 12)).foregroundStyle(GV.muted)
+                        } else {
+                            Text("Wyświetla cały rozpoznany tekst bez filtra — do kalibracji.")
+                                .font(.system(size: 12)).foregroundStyle(GV.azure)
+                        }
+                    } header: { Text("Tryb OCR") }
+
+                    // Lens picker
+                    Section {
+                        if engine.availableLenses.count > 1 {
+                            Picker("", selection: $engine.selectedLens) {
+                                ForEach(engine.availableLenses) { lens in
+                                    Text(lens.label).tag(lens)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .padding(.vertical, 4)
+                            Text("Aktywny: \(engine.selectedLens.label) — zmiana restartuje kamerę.")
+                                .font(.system(size: 12)).foregroundStyle(GV.muted)
+                        } else {
+                            Text("Tylko jeden obiektyw dostępny na tym urządzeniu.")
+                                .font(.system(size: 12)).foregroundStyle(GV.muted)
+                        }
+                    } header: { Text("Obiektyw kamery") }
 
                     // Voting
                     Section("Głosowanie (tryb TABLICA)") {
