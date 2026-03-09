@@ -1,3 +1,8 @@
+// GateVision iOS
+// Wklej do Xcode → New Project → App (SwiftUI) → zastąp ContentView.swift tym plikiem
+// Dodaj do Info.plist: NSCameraUsageDescription = "GateVision używa kamery do rozpoznawania tablic"
+// Minimum deployment: iOS 16+
+
 import SwiftUI
 import AVFoundation
 import Vision
