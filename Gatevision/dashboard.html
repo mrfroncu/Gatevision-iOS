@@ -31,7 +31,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellips
 .tab-panel{display:none;flex:1;overflow:hidden}
 .tab-panel.active{display:flex;flex-direction:column}
 #tab-live{flex-direction:row}
-.live-left{flex:1;display:flex;flex-direction:column;border-right:1px solid var(--border);overflow-y:auto;background:var(--bg)}
+.live-left{width:340px;flex-shrink:0;display:flex;flex-direction:column;border-right:1px solid var(--border);background:var(--bg)}
+.live-center{flex:1;display:flex;flex-direction:column;overflow-y:auto;background:var(--bg)}
 .gate-bar{padding:14px 22px;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
 .gate-state{display:flex;align-items:center;gap:14px;font-family:'Syne',sans-serif;font-weight:800}
 .gate-icon{font-size:26px;width:52px;height:52px;display:flex;align-items:center;justify-content:center;border-radius:50%}
@@ -60,6 +61,13 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellips
 .badge-b{background:rgba(255,59,59,.1);border:1px solid rgba(255,59,59,.3);color:var(--red)}
 .badge-u{background:rgba(107,100,133,.1);border:1px solid rgba(107,100,133,.3);color:var(--muted)}
 .badge-f{background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.2);color:var(--azure);cursor:pointer}
+.cam-feed-wrap{position:relative;background:#000;border-top:1px solid var(--border);border-bottom:1px solid var(--border);overflow:hidden;flex:1;min-height:300px}
+.cam-feed{width:100%;height:100%;object-fit:contain;display:block;background:#000}
+.cam-overlay{position:absolute;inset:0;pointer-events:none}
+.cam-badge{position:absolute;top:10px;left:10px;display:flex;align-items:center;gap:5px;padding:3px 9px;background:rgba(7,5,15,.75);border:1px solid rgba(184,255,53,.3);border-radius:20px;backdrop-filter:blur(6px)}
+.cam-badge-dot{width:7px;height:7px;border-radius:50%;background:var(--lime);animation:p 1s ease-in-out infinite}
+.cam-badge-label{font-size:10px;font-weight:700;font-family:'DM Mono',monospace;color:var(--lime)}
+.cam-err{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--muted);gap:10px;font-size:13px}
 .log-meta{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);font-family:'DM Mono',monospace}
 .btn{display:inline-flex;align-items:center;gap:5px;padding:7px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s;font-family:'DM Sans',sans-serif}
 .btn-g{background:rgba(52,199,89,.1);border:1px solid rgba(52,199,89,.3);color:var(--green)}
@@ -124,7 +132,28 @@ input[type=number]{background:rgba(255,255,255,.06);border:1px solid var(--borde
   </div>
   <div id="content">
     <div class="tab-panel active" id="tab-live">
+      <!-- Lewa kolumna: pionowy podgląd kamery -->
       <div class="live-left">
+        <div style="padding:10px 12px;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
+          <span style="font-family:'Syne',sans-serif;font-size:12px;font-weight:700"><i class="fa-solid fa-video" style="color:var(--purple);margin-right:5px"></i>Kamera</span>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-o btn-sm" onclick="toggleStream()" id="stream-btn"><i class="fa-solid fa-play"></i> Start</button>
+            <button class="btn btn-o btn-sm" onclick="takeSnapshot()" title="Zapisz zdjęcie"><i class="fa-solid fa-camera"></i></button>
+          </div>
+        </div>
+        <div class="cam-feed-wrap" id="cam-wrap">
+          <div class="cam-err" id="cam-placeholder"><i class="fa-solid fa-video-slash" style="font-size:28px"></i><span>Kliknij Start</span></div>
+          <img class="cam-feed" id="cam-img" style="display:none" alt="stream">
+          <div class="cam-overlay">
+            <div class="cam-badge" id="cam-live-badge" style="display:none">
+              <div class="cam-badge-dot"></div>
+              <span class="cam-badge-label">LIVE</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- Środkowa kolumna: brama + metryki -->
+      <div class="live-center">
         <div class="gate-bar">
           <div class="gate-state closed" id="gs"><div class="gate-icon"><i class="fa-solid fa-door-closed" id="gi"></i></div><span class="gate-label" id="gl">BRAMA ZAMKNIĘTA</span></div>
           <div class="gate-btns">
@@ -138,7 +167,7 @@ input[type=number]{background:rgba(255,255,255,.06);border:1px solid var(--borde
           <div class="dash-card"><div class="dash-card-title"><i class="fa-solid fa-camera" style="color:var(--purple)"></i> Kamera</div><div class="dash-card-value" id="dc" style="font-size:1.3rem">—</div><div class="dash-card-sub" id="dm"></div></div>
           <div class="dash-card"><div class="dash-card-title"><i class="fa-solid fa-clock" style="color:var(--orange)"></i> Czas sesji</div><div class="dash-card-value" id="du" style="color:var(--orange);font-size:1.7rem">00:00:00</div><div class="dash-card-sub" id="dd">0 detekcji</div></div>
         </div>
-      </div>
+      </div><!-- end live-center -->
       <div class="live-right">
         <div class="panel-head"><span class="panel-title"><i class="fa-solid fa-bolt" style="color:var(--lime);margin-right:4px"></i>Detekcje na żywo</span><button class="btn btn-o btn-sm" onclick="clearLive()"><i class="fa-solid fa-trash"></i></button></div>
         <div class="live-log-list" id="ll"></div>
@@ -146,7 +175,7 @@ input[type=number]{background:rgba(255,255,255,.06);border:1px solid var(--borde
     </div>
     <div class="tab-panel" id="tab-log">
       <div class="toolbar"><div class="search-box"><i class="fa-solid fa-magnifying-glass" style="color:var(--muted)"></i><input class="search-input" id="ls" placeholder="Szukaj tablicy..." oninput="deb(loadLog,350)()"></div><button class="btn btn-o btn-sm" onclick="loadLog()"><i class="fa-solid fa-rotate"></i></button><span style="font-size:11px;color:var(--muted);font-family:'DM Mono',monospace" id="lc"></span></div>
-      <div class="table-wrap"><table><thead><tr><th>#</th><th>Tablica</th><th>Status</th><th>Właściciel</th><th>Pewność</th><th>Czas</th></tr></thead><tbody id="lb"></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>#</th><th>Tablica</th><th>Status</th><th>Właściciel</th><th>Pewność</th><th>Czas</th><th>Foto</th></tr></thead><tbody id="lb"></tbody></table></div>
     </div>
     <div class="tab-panel" id="tab-plates">
       <div class="toolbar"><div class="search-box" style="max-width:300px"><i class="fa-solid fa-magnifying-glass" style="color:var(--muted)"></i><input class="search-input" id="ps" placeholder="Szukaj..." oninput="deb(loadPlates,300)()"></div><button class="btn btn-p btn-sm" onclick="openModal()"><i class="fa-solid fa-plus"></i> Dodaj</button><span style="margin-left:auto;font-size:11px;color:var(--muted);font-family:'DM Mono',monospace" id="pc"></span></div>
@@ -224,7 +253,43 @@ async function pollLive(){
 setInterval(pollLive,700);pollLive();
 function clearLive(){document.getElementById('ll').innerHTML='';_seen.clear();}
 function quickAdd(p){openModal();document.getElementById('fp').value=p;}
-async function loadLog(){const q=document.getElementById('ls')?.value||'';const d=await api('GET','/api/log?q='+encodeURIComponent(q));document.getElementById('lc').textContent=d.total+' wpisów';document.getElementById('lb').innerHTML=d.items.map(r=>{const c=r.granted?'var(--lime)':r.blocked?'var(--red)':'var(--muted)';const b=r.granted?'<span class="chip" style="background:rgba(184,255,53,.1);color:var(--lime)">✓ Dostęp</span>':r.blocked?'<span class="chip" style="background:rgba(255,59,59,.1);color:var(--red)">✗ Zablok.</span>':'<span class="chip" style="background:rgba(107,100,133,.1);color:var(--muted)">? Nieznany</span>';return`<tr><td style="color:var(--muted);font-family:'DM Mono',monospace;font-size:11px">${r.id}</td><td style="font-family:'Syne',sans-serif;font-weight:800;color:${c}">${r.plate}</td><td>${b}</td><td style="color:var(--muted);font-size:12px">${r.owner_name||'—'}</td><td style="color:var(--azure);font-family:'DM Mono',monospace;font-size:12px">${r.confidence.toFixed(0)}%</td><td style="color:var(--muted);font-family:'DM Mono',monospace;font-size:11px">${r.timestamp}</td></tr>`}).join('');}
+async function loadLog(){
+  const q=document.getElementById('ls')?.value||'';
+  const d=await api('GET','/api/log?q='+encodeURIComponent(q));
+  document.getElementById('lc').textContent=d.total+' wpisów';
+  document.getElementById('lb').innerHTML=d.items.map(r=>{
+    const c=r.granted?'var(--lime)':r.blocked?'var(--red)':'var(--muted)';
+    const b=r.granted?'<span class="chip" style="background:rgba(184,255,53,.1);color:var(--lime)">✓ Dostęp</span>':r.blocked?'<span class="chip" style="background:rgba(255,59,59,.1);color:var(--red)">✗ Zablok.</span>':'<span class="chip" style="background:rgba(107,100,133,.1);color:var(--muted)">? Nieznany</span>';
+    const foto=r.has_snapshot
+      ? `<img src="/api/log/${r.id}/snapshot" style="width:72px;height:45px;object-fit:cover;border-radius:5px;cursor:pointer;border:1px solid var(--border)" onclick="openSnap(${r.id},'${r.plate}','${r.timestamp}')">`
+      : '<span style="color:var(--border);font-size:11px">—</span>';
+    return`<tr>
+      <td style="color:var(--muted);font-family:'DM Mono',monospace;font-size:11px">${r.id}</td>
+      <td style="font-family:'Syne',sans-serif;font-weight:800;color:${c}">${r.plate}</td>
+      <td>${b}</td>
+      <td style="color:var(--muted);font-size:12px">${r.owner_name||'—'}</td>
+      <td style="color:var(--azure);font-family:'DM Mono',monospace;font-size:12px">${r.confidence.toFixed(0)}%</td>
+      <td style="color:var(--muted);font-family:'DM Mono',monospace;font-size:11px">${r.timestamp}</td>
+      <td>${foto}</td>
+    </tr>`;
+  }).join('');
+}
+// Lightbox dla snapshotów w logach
+function openSnap(id,plate,ts){
+  let bg=document.getElementById('snap-modal');
+  if(!bg){
+    bg=document.createElement('div');
+    bg.id='snap-modal';
+    bg.style='position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:200;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;cursor:pointer;backdrop-filter:blur(8px)';
+    bg.onclick=()=>bg.remove();
+    document.body.appendChild(bg);
+  }
+  bg.innerHTML=`<div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:900;color:#e8e4f0">${plate}</div>
+    <img src="/api/log/${id}/snapshot" style="max-width:90vw;max-height:75vh;border-radius:10px;border:1px solid rgba(255,255,255,.1)">
+    <div style="font-size:12px;font-family:'DM Mono',monospace;color:#6b6485">${ts} &nbsp;·&nbsp; kliknij by zamknąć</div>
+    <a href="/api/log/${id}/snapshot" download="snap_${plate}_${ts.replace(/[: ]/g,'-')}.jpg" onclick="event.stopPropagation()" style="color:var(--azure);font-size:12px">⬇ pobierz</a>`;
+  bg.style.display='flex';
+}
 async function loadPlates(){const q=document.getElementById('ps')?.value||'';const plates=await api('GET','/api/plates?q='+encodeURIComponent(q));document.getElementById('pc').textContent=plates.length+' tablic';document.getElementById('pl').innerHTML=plates.map(p=>`<div class="plate-row"><span class="plate-num" style="${p.blocked?'color:var(--red)':''}">${p.plate}</span>${p.is_fleet?'<span style="font-size:10px;color:var(--purple);background:rgba(155,77,255,.1);border:1px solid rgba(155,77,255,.3);padding:2px 8px;border-radius:20px">Flota</span>':''}${p.blocked?'<span style="font-size:10px;color:var(--red);background:rgba(255,59,59,.1);border:1px solid rgba(255,59,59,.3);padding:2px 8px;border-radius:20px">Zablok.</span>':''}<span class="plate-owner">${p.owner_name||'—'}</span><div class="plate-actions"><button class="btn btn-o btn-sm" onclick='editPlate(${JSON.stringify(p).replace(/"/g,"&quot;")})'><i class="fa-solid fa-pen"></i></button><button class="btn btn-sm" style="background:rgba(229,160,13,.1);border:1px solid rgba(229,160,13,.3);color:var(--orange)" onclick="toggleBlock(${p.id})"><i class="fa-solid fa-ban"></i></button><button class="btn btn-sm" style="background:rgba(255,59,59,.08);border:1px solid rgba(255,59,59,.2);color:var(--red)" onclick="delPlate(${p.id})"><i class="fa-solid fa-trash"></i></button></div></div>`).join('');}
 async function toggleBlock(id){await api('POST','/api/plates/'+id+'/toggle_block');loadPlates();}
 async function delPlate(id){if(confirm('Usunąć?')){await api('DELETE','/api/plates/'+id);loadPlates();}}
@@ -259,4 +324,42 @@ function setLens(l){
 function setModeUI(m){document.getElementById('ocr-plate').className='ocr-opt'+(m==='plate'?' ap':'');document.getElementById('ocr-free').className='ocr-opt'+(m==='free'?' af':'');}
 async function setMode(m){setModeUI(m);await api('POST','/api/settings',{ocr_mode:m});}
 async function saveSettings(){await api('POST','/api/settings',{gate_opening_time:+document.getElementById('s1').value,gate_open_duration:+document.getElementById('s2').value,gate_closing_time:+document.getElementById('s3').value,min_votes:+document.getElementById('s4').value,vote_window:+document.getElementById('s5').value});const e=document.getElementById('sm');e.style.display='block';setTimeout(()=>e.style.display='none',2000);}
+
+// ── Podgląd kamery ────────────────────────────────────────────────────────────
+let _streamActive = false;
+function toggleStream() {
+  _streamActive ? stopStream() : startStream();
+}
+function startStream() {
+  const img = document.getElementById('cam-img');
+  const ph  = document.getElementById('cam-placeholder');
+  const btn = document.getElementById('stream-btn');
+  const badge = document.getElementById('cam-live-badge');
+  // Timestamp wymusza nowe połączenie
+  img.src = '/api/stream?t=' + Date.now();
+  img.style.display = 'block';
+  ph.style.display  = 'none';
+  badge.style.display = 'flex';
+  btn.innerHTML = '<i class="fa-solid fa-stop"></i> Stop';
+  _streamActive = true;
+  img.onerror = () => { stopStream(); };
+}
+function stopStream() {
+  const img = document.getElementById('cam-img');
+  const ph  = document.getElementById('cam-placeholder');
+  const btn = document.getElementById('stream-btn');
+  const badge = document.getElementById('cam-live-badge');
+  img.src = '';
+  img.style.display = 'none';
+  ph.style.display  = 'flex';
+  badge.style.display = 'none';
+  btn.innerHTML = '<i class="fa-solid fa-play"></i> Start';
+  _streamActive = false;
+}
+function takeSnapshot() {
+  const a = document.createElement('a');
+  a.href = '/api/snapshot?t=' + Date.now();
+  a.download = 'gatevision_' + new Date().toISOString().replace(/[:.]/g,'-') + '.jpg';
+  a.click();
+}
 </script></body></html>

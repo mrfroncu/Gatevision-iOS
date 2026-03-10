@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import AVFoundation
 import Vision
 import SQLite3
@@ -41,6 +42,7 @@ struct LogEntry: Identifiable {
     let plate, rawOcr, ownerName, timestamp: String
     let confidence: Double
     let granted, blocked, isFleet, isFreeMode: Bool
+    var snapshotData: Data? = nil   // JPEG klatki w momencie detekcji
 }
 
 enum OCRMode: String, CaseIterable, Identifiable {
@@ -125,7 +127,10 @@ final class Database {
             plate TEXT NOT NULL,raw_ocr TEXT DEFAULT '',confidence REAL DEFAULT 0,
             granted INTEGER DEFAULT 0,blocked INTEGER DEFAULT 0,
             owner_name TEXT DEFAULT '',is_fleet INTEGER DEFAULT 0,
+            snapshot_jpeg BLOB,
             timestamp TEXT DEFAULT (datetime('now','localtime')));
+        -- migracja dla istniejących baz danych
+        ALTER TABLE access_log ADD COLUMN snapshot_jpeg BLOB;
         INSERT OR IGNORE INTO plates(plate,owner_name,is_fleet,blocked) VALUES
             ('WA12345','Jan Kowalski',0,0),('KR99999','Flota firmowa',1,0),
             ('PO55123','Anna Nowak',0,0),('GD00001','Tomasz Więcek',0,1);
@@ -181,27 +186,53 @@ final class Database {
         return all.first { clean == $0.plate || clean.contains($0.plate) }
     }
 
-    @discardableResult func logAccess(plate: String, raw: String, conf: Double, granted: Bool, blocked: Bool, owner: String, fleet: Bool) -> Int64 {
+    @discardableResult func logAccess(plate: String, raw: String, conf: Double, granted: Bool, blocked: Bool, owner: String, fleet: Bool, snapshot: Data? = nil) -> Int64 {
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db,"INSERT INTO access_log(plate,raw_ocr,confidence,granted,blocked,owner_name,is_fleet) VALUES(?,?,?,?,?,?,?)",-1,&stmt,nil)==SQLITE_OK else { return 0 }
+        guard sqlite3_prepare_v2(db,"INSERT INTO access_log(plate,raw_ocr,confidence,granted,blocked,owner_name,is_fleet,snapshot_jpeg) VALUES(?,?,?,?,?,?,?,?)",-1,&stmt,nil)==SQLITE_OK else { return 0 }
         sqlite3_bind_text(stmt,1,(plate as NSString).utf8String,-1,nil)
         sqlite3_bind_text(stmt,2,(raw as NSString).utf8String,-1,nil)
         sqlite3_bind_double(stmt,3,conf)
         sqlite3_bind_int(stmt,4,granted ? 1:0); sqlite3_bind_int(stmt,5,blocked ? 1:0)
         sqlite3_bind_text(stmt,6,(owner as NSString).utf8String,-1,nil)
         sqlite3_bind_int(stmt,7,fleet ? 1:0)
+        if let jpeg = snapshot {
+            jpeg.withUnsafeBytes { sqlite3_bind_blob(stmt, 8, $0.baseAddress, Int32($0.count), nil) }
+        } else {
+            sqlite3_bind_null(stmt, 8)
+        }
         sqlite3_step(stmt); sqlite3_finalize(stmt)
         return sqlite3_last_insert_rowid(db)
     }
 
     func fetchLog(query q: String = "", limit: Int = 200) -> [LogEntry] {
+        // BLOB nie ładujemy tu — za ciężkie przy 200 wpisach. Używamy fetchSnapshot(id:) osobno.
         let sql = q.isEmpty
-            ? "SELECT id,plate,raw_ocr,confidence,granted,blocked,owner_name,is_fleet,timestamp FROM access_log ORDER BY id DESC LIMIT \(limit)"
-            : "SELECT id,plate,raw_ocr,confidence,granted,blocked,owner_name,is_fleet,timestamp FROM access_log WHERE plate LIKE '%\(q)%' OR owner_name LIKE '%\(q)%' ORDER BY id DESC LIMIT \(limit)"
-        return query(sql) { s in LogEntry(id:sqlite3_column_int64(s,0),plate:col(s,1),rawOcr:col(s,2),ownerName:col(s,6),timestamp:col(s,8),confidence:sqlite3_column_double(s,3),granted:sqlite3_column_int(s,4) != 0,blocked:sqlite3_column_int(s,5) != 0,isFleet:sqlite3_column_int(s,7) != 0,isFreeMode:false) }
+            ? "SELECT id,plate,raw_ocr,confidence,granted,blocked,owner_name,is_fleet,timestamp,(snapshot_jpeg IS NOT NULL) as has_snap FROM access_log ORDER BY id DESC LIMIT \(limit)"
+            : "SELECT id,plate,raw_ocr,confidence,granted,blocked,owner_name,is_fleet,timestamp,(snapshot_jpeg IS NOT NULL) as has_snap FROM access_log WHERE plate LIKE '%\(q)%' OR owner_name LIKE '%\(q)%' ORDER BY id DESC LIMIT \(limit)"
+        return query(sql) { s in
+            // has_snap = 1 → wstawiamy marker Data(1 bajt) by snapshotData != nil
+            let hasSnap = sqlite3_column_int(s, 9) != 0
+            return LogEntry(id:sqlite3_column_int64(s,0),plate:col(s,1),rawOcr:col(s,2),
+                ownerName:col(s,6),timestamp:col(s,8),confidence:sqlite3_column_double(s,3),
+                granted:sqlite3_column_int(s,4) != 0,blocked:sqlite3_column_int(s,5) != 0,
+                isFleet:sqlite3_column_int(s,7) != 0,isFreeMode:false,
+                snapshotData: hasSnap ? Data([1]) : nil)  // marker — thumbnail ładuje lazy
+        }
     }
 
     func clearLog() { exec("DELETE FROM access_log") }
+
+    func fetchSnapshot(logId: Int64) -> Data? {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db,"SELECT snapshot_jpeg FROM access_log WHERE id=?",-1,&stmt,nil)==SQLITE_OK else { return nil }
+        sqlite3_bind_int64(stmt,1,logId)
+        guard sqlite3_step(stmt)==SQLITE_ROW else { sqlite3_finalize(stmt); return nil }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_column_type(stmt,0) != SQLITE_NULL else { return nil }
+        let bytes = sqlite3_column_bytes(stmt,0)
+        guard bytes > 0, let ptr = sqlite3_column_blob(stmt,0) else { return nil }
+        return Data(bytes: ptr, count: Int(bytes))
+    }
 }
 
 // MARK: ─── Web Server ─────────────────────────────────────────────────────────
@@ -236,12 +267,56 @@ final class WebServer: ObservableObject {
             let parts = (lines.first ?? "").components(separatedBy: " ")
             let method = parts.count > 0 ? parts[0] : "GET"
             let path   = parts.count > 1 ? parts[1] : "/"
-            let body   = req.components(separatedBy: "\r\n\r\n").dropFirst().joined(separator: "\r\n\r\n")
+            let cp     = path.components(separatedBy: "?").first ?? path
+
+            // MJPEG stream — osobna ścieżka, trzyma połączenie otwarte
+            if method == "GET" && cp == "/api/stream" {
+                self.handleStream(conn)
+                return
+            }
+
+            let body = req.components(separatedBy: "\r\n\r\n").dropFirst().joined(separator: "\r\n\r\n")
             let (code, mime, respData) = self.route(method: method, path: path, body: body)
             let hdr = "HTTP/1.1 \(code) OK\r\nContent-Type: \(mime)\r\nContent-Length: \(respData.count)\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
             var out = Data(hdr.utf8); out.append(respData)
             conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
         }
+    }
+
+    // ── MJPEG stream ──────────────────────────────────────────────────────────
+    private func handleStream(_ conn: NWConnection) {
+        let boundary = "gvframe"
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=\(boundary)\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+        conn.send(content: Data(header.utf8), completion: .idempotent)
+        sendNextFrame(conn: conn, boundary: boundary)
+    }
+
+    private func sendNextFrame(conn: NWConnection, boundary: String) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.2) { [weak self, weak conn] in
+            guard let self, let conn else { return }
+            let jpeg = self.engine?.latestJpeg
+            let frameData = jpeg ?? self.placeholderJpeg()
+            var part = Data()
+            part.append(Data("--\(boundary)\r\n".utf8))
+            part.append(Data("Content-Type: image/jpeg\r\nContent-Length: \(frameData.count)\r\n\r\n".utf8))
+            part.append(frameData)
+            part.append(Data("\r\n".utf8))
+            conn.send(content: part, completion: .contentProcessed { [weak self, weak conn] err in
+                guard err == nil, let self, let conn else { return }
+                self.sendNextFrame(conn: conn, boundary: boundary)
+            })
+        }
+    }
+
+    /// Czarny placeholder JPEG gdy kamera jeszcze nie gotowa
+    private func placeholderJpeg() -> Data {
+        let size = CGSize(width: 640, height: 360)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let img = renderer.image { ctx in
+            UIColor(red: 0.04, green: 0.03, blue: 0.09, alpha: 1).setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+        }
+        return img.jpegData(compressionQuality: 0.5) ?? Data()
     }
 
     // ── Router ────────────────────────────────────────────────────────────────
@@ -263,6 +338,12 @@ final class WebServer: ObservableObject {
         switch (method, cp) {
         case ("GET",  "/"):
             return (200, "text/html; charset=utf-8", Data(htmlPage().utf8))
+
+        case ("GET", "/api/snapshot"):
+            if let jpeg = e?.latestJpeg {
+                return (200, "image/jpeg", jpeg)
+            }
+            return (503, "text/plain", Data("no frame".utf8))
 
         case ("GET", "/api/status"):
             var status: [String: Any] = [:]
@@ -288,11 +369,23 @@ final class WebServer: ObservableObject {
 
         case ("GET", "/api/log"):
             let rows = db.fetchLog(query: qp("q")).map { x -> [String:Any] in
-                ["id":x.id,"plate":x.plate,"raw_ocr":x.rawOcr,"confidence":x.confidence,
-                 "granted":x.granted,"blocked":x.blocked,"owner_name":x.ownerName,
-                 "is_fleet":x.isFleet,"timestamp":x.timestamp]
+                var row: [String:Any] = ["id":x.id,"plate":x.plate,"raw_ocr":x.rawOcr,
+                    "confidence":x.confidence,"granted":x.granted,"blocked":x.blocked,
+                    "owner_name":x.ownerName,"is_fleet":x.isFleet,"timestamp":x.timestamp]
+                row["has_snapshot"] = x.snapshotData != nil
+                return row
             }
             return (200, "application/json", j(["total":rows.count,"items":rows]))
+
+        case ("GET", _) where cp.hasPrefix("/api/log/") && cp.hasSuffix("/snapshot"):
+            let parts2 = cp.components(separatedBy: "/")
+            guard parts2.count >= 4, let logId = Int64(parts2[parts2.count-2]) else {
+                return (400, "text/plain", Data("bad id".utf8))
+            }
+            if let jpeg = db.fetchSnapshot(logId: logId) {
+                return (200, "image/jpeg", jpeg)
+            }
+            return (404, "text/plain", Data("no snapshot".utf8))
 
         case ("GET", "/api/plates"):
             let plates = db.fetchPlates(query: qp("q")).map { p -> [String:Any] in
@@ -412,12 +505,20 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     @Published var liveLog:    [LogEntry]  = []
     @Published var cameraOK    = false
     @Published var ocrMode:    OCRMode   = .plate { didSet { _ocrModeSafe = ocrMode } }
+
+    // Najnowsza klatka jako JPEG + boxy wykrytych tablic (dla /api/snapshot i /api/stream)
+    var latestJpeg: Data? = nil
+    var detectedBoxes: [CGRect] = []
+    private let jpegLock = NSLock()
     @Published var selectedLens: LensType = .wide  { didSet { switchLens(to: selectedLens) } }
     @Published var availableLenses: [LensType] = []
     @Published var openDuration = 10.0
     @Published var openingTime = 2.0
     @Published var closingTime = 3.0
     @Published var minVotes = 2; @Published var voteWindowSize = 6
+    @Published var splashMinDuration: Double = UserDefaults.standard.double(forKey: "splashMinDuration").nonZeroOrDefault(0.7) {
+        didSet { UserDefaults.standard.set(splashMinDuration, forKey: "splashMinDuration") }
+    }
 
     private var _ocrModeSafe: OCRMode = .plate
     private let session = AVCaptureSession(); private let videoOut = AVCaptureVideoDataOutput()
@@ -467,16 +568,81 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             ocrCnt = 0; fpsMeasureTs = now
             DispatchQueue.main.async { self.ocrFPS = fps }
         }
+
         let req = VNRecognizeTextRequest { [weak self] r, _ in
             guard let self else { return }
-            let texts = (r.results as? [VNRecognizedTextObservation] ?? []).compactMap { o -> (String,Double)? in
+            let observations = r.results as? [VNRecognizedTextObservation] ?? []
+            let texts = observations.compactMap { o -> (String, Double)? in
                 guard let t = o.topCandidates(1).first else { return nil }
                 return (t.string, Double(t.confidence))
             }
-            if self._ocrModeSafe == .free { self.processFree(texts) } else { self.processPlate(texts) }
+            if self._ocrModeSafe == .free {
+                self.processFree(texts)
+            } else {
+                // Zbierz boxy kandydatów tablic przed głosowaniem
+                let plateObs = observations.filter { o in
+                    guard let t = o.topCandidates(1).first else { return false }
+                    let clean = t.string.uppercased().filter { $0.isLetter || $0.isNumber }
+                    return self.plateRE.firstMatch(in: clean, range: NSRange(clean.startIndex..., in: clean)) != nil
+                }
+                let boxes = plateObs.map { $0.boundingBox } // Vision coords: (0,0)=bottomLeft, normalized
+                self.jpegLock.lock()
+                self.detectedBoxes = boxes
+                self.jpegLock.unlock()
+                self.processPlate(texts)
+            }
         }
         req.recognitionLevel = .fast; req.usesLanguageCorrection = false; req.recognitionLanguages = ["en-US"]
-        try? VNImageRequestHandler(cvPixelBuffer:px).perform([req])
+        try? VNImageRequestHandler(cvPixelBuffer: px).perform([req])
+
+        // Zapisz JPEG co ~10 klatek (~3 fps dla streamu webowego)
+        guard ocrCnt % 10 == 0 else { return }
+        // Obróć CIImage o 90° zgodnie z ruchem wskazówek zegara (kamera pionowa → landscape dla web)
+        // i zastosuj poziomy flip by usunąć efekt lustrzany
+        let ciRaw = CIImage(cvPixelBuffer: px)
+        let ciRotated = ciRaw
+            .transformed(by: CGAffineTransform(rotationAngle: -.pi / 2))   // -90° = obrót w prawo
+            .transformed(by: CGAffineTransform(scaleX: -1, y: 1)           // flip poziomy — usuwa mirror
+                .concatenating(CGAffineTransform(translationX: ciRaw.extent.height, y: 0)))
+        let context = CIContext()
+        let rotatedExtent = ciRotated.extent
+        guard let cgImage = context.createCGImage(ciRotated, from: rotatedExtent) else { return }
+        let outSize = CGSize(width: rotatedExtent.width, height: rotatedExtent.height)
+
+        // Narysuj boxy wykrytych tablic
+        jpegLock.lock()
+        let boxes = detectedBoxes
+        jpegLock.unlock()
+
+        let uiImage = drawBoxes(on: cgImage, boxes: boxes, size: outSize)
+        if let jpeg = uiImage.jpegData(compressionQuality: 0.6) {
+            jpegLock.lock()
+            latestJpeg = jpeg
+            jpegLock.unlock()
+        }
+    }
+
+    /// Rysuje zielone ramki wokół wykrytych tablic na klatce
+    private func drawBoxes(on cgImage: CGImage, boxes: [CGRect], size: CGSize) -> UIImage {
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { ctx in
+            let c = ctx.cgContext
+            // Rysuj bazowy obraz
+            c.draw(cgImage, in: CGRect(origin: .zero, size: size))
+            guard !boxes.isEmpty else { return }
+            c.setStrokeColor(UIColor(red: 0.72, green: 1.0, blue: 0.21, alpha: 1).cgColor) // GV.lime
+            c.setLineWidth(3)
+            // Vision bbox: origin bottom-left, y odwrócone względem UIKit
+            for box in boxes {
+                let rect = CGRect(
+                    x:      box.origin.x * size.width,
+                    y:      (1 - box.origin.y - box.size.height) * size.height,
+                    width:  box.size.width  * size.width,
+                    height: box.size.height * size.height
+                )
+                c.stroke(rect.insetBy(dx: -4, dy: -4))
+            }
+        }
     }
 
     private func processFree(_ texts: [(String,Double)]) {
@@ -524,8 +690,12 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let matched = row?.plate ?? plate
         let granted = row != nil && !(row!.blocked)
         let blocked = row?.blocked ?? false
-        let logId = Database.shared.logAccess(plate:matched,raw:plate,conf:99,granted:granted,blocked:blocked,owner:row?.ownerName ?? "",fleet:row?.isFleet ?? false)
-        let entry = LogEntry(id:logId,plate:matched,rawOcr:plate,ownerName:row?.ownerName ?? "",timestamp:ts(),confidence:99,granted:granted,blocked:blocked,isFleet:row?.isFleet ?? false,isFreeMode:false)
+        // Snapshot tylko gdy dostęp przyznany (brama się otworzy)
+        jpegLock.lock()
+        let snap: Data? = granted ? latestJpeg : nil
+        jpegLock.unlock()
+        let logId = Database.shared.logAccess(plate:matched,raw:plate,conf:99,granted:granted,blocked:blocked,owner:row?.ownerName ?? "",fleet:row?.isFleet ?? false,snapshot:snap)
+        let entry = LogEntry(id:logId,plate:matched,rawOcr:plate,ownerName:row?.ownerName ?? "",timestamp:ts(),confidence:99,granted:granted,blocked:blocked,isFleet:row?.isFleet ?? false,isFreeMode:false,snapshotData:snap)
         DispatchQueue.main.async {
             self.lastPlate = matched; self.liveLog.insert(entry,at:0)
             if self.liveLog.count > 100 { self.liveLog.removeLast() }
@@ -571,6 +741,9 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
 extension DateFormatter {
     func apply(_ f: (DateFormatter)->Void) -> DateFormatter { f(self); return self }
+}
+extension Double {
+    func nonZeroOrDefault(_ d: Double) -> Double { self == 0 ? d : self }
 }
 
 // MARK: ─── Camera Preview ─────────────────────────────────────────────────────
@@ -841,7 +1014,7 @@ struct RootView: View {
         .onAppear {
             webServer.start(engine: engine)
             // Minimum czas wyświetlania splash
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + engine.splashMinDuration) {
                 minTimeDone = true
                 checkDismiss()
             }
@@ -1008,31 +1181,6 @@ struct StatusTab: View {
             }
             .scrollContentBackground(.hidden)
             .navigationTitle("GateVision")
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    // Kamera — bez ramki, tylko kolorowa kropka + tekst
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(engine.cameraOK ? GV.green : GV.red)
-                            .frame(width: 7, height: 7)
-                            .shadow(color: (engine.cameraOK ? GV.green : GV.red).opacity(0.9), radius: 4)
-                        Text(engine.cameraOK ? "CAM" : "NO CAM")
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundStyle(engine.cameraOK ? GV.green : GV.red)
-                    }
-                    // Stan bramy — bez ramki
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(engine.gateState.color)
-                            .frame(width: 7, height: 7)
-                            .shadow(color: engine.gateState.color.opacity(0.9), radius: 4)
-                        Text(engine.gateState.rawValue)
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundStyle(engine.gateState.color)
-                            .fixedSize()
-                    }
-                }
-            }
         }
     }
 }
@@ -1108,26 +1256,116 @@ struct DBLogView: View {
 
 struct LogRowFull: View {
     let entry: LogEntry
+    @State private var showSnapshot = false
     var color: Color { entry.granted ? GV.lime : entry.blocked ? GV.red : entry.isFreeMode ? GV.azure : GV.muted }
     var statusLabel: String { entry.granted ? "Dostęp" : entry.blocked ? "Zablok." : entry.isFreeMode ? "Wolny" : "Nieznany" }
 
     var body: some View {
-        HStack(spacing:12) {
-            Circle().fill(color).frame(width:8,height:8).shadow(color:color.opacity(0.9),radius:5)
-            VStack(alignment:.leading,spacing:3) {
-                HStack {
-                    Text(entry.plate).font(.system(size:16,weight:.bold,design:.monospaced)).foregroundStyle(color)
-                    if entry.confidence > 0 && entry.confidence < 99 {
-                        Text(String(format:"%.0f%%",entry.confidence)).font(.system(size:10,weight:.bold,design:.monospaced)).foregroundStyle(entry.confidence>=80 ? GV.lime:GV.orange)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                Circle().fill(color).frame(width:8,height:8).shadow(color:color.opacity(0.9),radius:5)
+                VStack(alignment:.leading,spacing:3) {
+                    HStack {
+                        Text(entry.plate).font(.system(size:16,weight:.bold,design:.monospaced)).foregroundStyle(color)
+                        if entry.confidence > 0 && entry.confidence < 99 {
+                            Text(String(format:"%.0f%%",entry.confidence)).font(.system(size:10,weight:.bold,design:.monospaced)).foregroundStyle(entry.confidence>=80 ? GV.lime:GV.orange)
+                        }
+                        Spacer()
+                        Text(statusLabel).font(.system(size:10,weight:.bold)).foregroundStyle(color).padding(.horizontal,8).padding(.vertical,3).background(color.opacity(0.1)).clipShape(Capsule())
                     }
-                    Spacer()
-                    Text(statusLabel).font(.system(size:10,weight:.bold)).foregroundStyle(color).padding(.horizontal,8).padding(.vertical,3).background(color.opacity(0.1)).clipShape(Capsule())
+                    if !entry.ownerName.isEmpty { Text(entry.ownerName).font(.system(size:12)).foregroundStyle(GV.muted) }
+                    Text(entry.timestamp).font(.system(size:10,design:.monospaced)).foregroundStyle(GV.muted)
                 }
-                if !entry.ownerName.isEmpty { Text(entry.ownerName).font(.system(size:12)).foregroundStyle(GV.muted) }
-                Text(entry.timestamp).font(.system(size:10,design:.monospaced)).foregroundStyle(GV.muted)
+
+                // Miniatura snapshot — ładuje JPEG bezpośrednio z DB
+                if entry.snapshotData != nil {
+                    SnapshotThumbnail(logId: entry.id, color: color)
+                        .onTapGesture { showSnapshot = true }
+                }
             }
         }
-        .padding(.vertical,4).listRowBackground(Color.clear).listRowSeparatorTint(GV.border)
+        .padding(.vertical,6)
+        .listRowBackground(Color.clear)
+        .listRowSeparatorTint(GV.border)
+        .sheet(isPresented: $showSnapshot) {
+            SnapshotViewerFromDB(logId: entry.id, plate: entry.plate, timestamp: entry.timestamp)
+        }
+    }
+}
+
+struct SnapshotThumbnail: View {
+    let logId: Int64; let color: Color
+    @State private var image: UIImage? = nil
+
+    var body: some View {
+        Group {
+            if let img = image {
+                Image(uiImage: img)
+                    .resizable().scaledToFill()
+                    .frame(width: 64, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius:6).strokeBorder(color.opacity(0.4),lineWidth:1))
+                    .overlay(alignment:.bottomTrailing) {
+                        Image(systemName:"arrow.up.left.and.arrow.down.right")
+                            .font(.system(size:8,weight:.bold)).foregroundStyle(.white)
+                            .padding(3).background(.black.opacity(0.5))
+                            .clipShape(RoundedRectangle(cornerRadius:3))
+                    }
+            } else {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(color.opacity(0.08))
+                    .frame(width: 64, height: 40)
+                    .overlay(ProgressView().scaleEffect(0.5).tint(color))
+            }
+        }
+        .onAppear { loadIfNeeded() }
+    }
+
+    private func loadIfNeeded() {
+        guard image == nil else { return }
+        DispatchQueue.global(qos: .utility).async {
+            if let data = Database.shared.fetchSnapshot(logId: logId),
+               let img = UIImage(data: data) {
+                DispatchQueue.main.async { self.image = img }
+            }
+        }
+    }
+}
+
+struct SnapshotViewerFromDB: View {
+    let logId: Int64; let plate: String; let timestamp: String
+    @State private var image: UIImage? = nil
+    @Environment(\.dismiss) var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if let img = image {
+                    Image(uiImage: img).resizable().scaledToFit().ignoresSafeArea()
+                } else {
+                    ProgressView().tint(GV.lime)
+                }
+            }
+            .navigationTitle(plate).navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement:.topBarLeading) {
+                    Text(timestamp).font(.system(size:12,design:.monospaced)).foregroundStyle(.white.opacity(0.6))
+                }
+                ToolbarItem(placement:.topBarTrailing) {
+                    Button("Zamknij") { dismiss() }.tint(GV.lime)
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+        .onAppear {
+            DispatchQueue.global(qos:.userInitiated).async {
+                if let data = Database.shared.fetchSnapshot(logId: logId),
+                   let img = UIImage(data: data) {
+                    DispatchQueue.main.async { self.image = img }
+                }
+            }
+        }
     }
 }
 
@@ -1242,7 +1480,7 @@ struct SettingsTab: View {
             ZStack {
                 LinearGradient(colors:[GV.bgTop,GV.bgBottom],startPoint:.top,endPoint:.bottom).ignoresSafeArea()
                 Form {
-                    // Web server status
+                    // ── Panel Web ────────────────────────────────────────
                     Section {
                         HStack(spacing:14) {
                             ZStack {
@@ -1280,11 +1518,13 @@ struct SettingsTab: View {
                         }.padding(.vertical,6)
                     } header: { Text("Panel Web — port 6600") }
 
+                    // ── OCR ──────────────────────────────────────────────
                     Section {
                         Picker("Tryb",selection:$engine.ocrMode) { ForEach(OCRMode.allCases) { Text($0.label).tag($0) } }.pickerStyle(.segmented)
                         Text(engine.ocrMode.description).font(.system(size:12)).foregroundStyle(engine.ocrMode == .plate ? GV.muted:GV.azure)
                     } header: { Text("Tryb OCR") }
 
+                    // ── Obiektyw ─────────────────────────────────────────
                     Section {
                         if engine.availableLenses.count > 1 {
                             Picker("Obiektyw",selection:$engine.selectedLens) { ForEach(engine.availableLenses) { Text($0.label).tag($0) } }.pickerStyle(.segmented)
@@ -1293,15 +1533,20 @@ struct SettingsTab: View {
                         }
                     } header: { Text("Obiektyw") }
 
+                    // ── Głosowanie ───────────────────────────────────────
                     Section("Głosowanie") {
                         Stepper("Min. powtórzeń: \(engine.minVotes)",value:$engine.minVotes,in:1...10)
                         Stepper("Okno: \(engine.voteWindowSize) klatek",value:$engine.voteWindowSize,in:2...20)
                     }
+
+                    // ── Czasy bramy ──────────────────────────────────────
                     Section("Czasy bramy") {
                         Stepper("Otwieranie: \(Int(engine.openingTime))s",value:$engine.openingTime,in:1...30)
                         Stepper("Otwarcie: \(Int(engine.openDuration))s",value:$engine.openDuration,in:1...120)
                         Stepper("Zamykanie: \(Int(engine.closingTime))s",value:$engine.closingTime,in:1...30)
                     }
+
+                    // ── Info ─────────────────────────────────────────────
                     Section("Info") {
                         LabeledContent("Silnik OCR",value:"Apple Vision")
                         LabeledContent("OCR FPS",value:String(format:"%.1f fps",engine.ocrFPS))
@@ -1309,6 +1554,18 @@ struct SettingsTab: View {
                         LabeledContent("Brama",value:engine.gateState.rawValue)
                         LabeledContent("Adres web",value:webServer.isRunning ? "http://\(webServer.localIP):6600":"—")
                     }
+
+                    // ── Debug ────────────────────────────────────────────
+                    Section {
+                        NavigationLink {
+                            DebugTab(engine: engine)
+                        } label: {
+                            Label("Debug", systemImage: "ladybug.fill")
+                                .foregroundStyle(GV.orange)
+                        }
+                    } header: { Text("Narzędzia") }
+
+                    // ── Dane ─────────────────────────────────────────────
                     Section {
                         Button(role:.destructive) {
                             sqlite3_exec(Database.shared.rawDB,"DELETE FROM access_log",nil,nil,nil)
@@ -1319,5 +1576,96 @@ struct SettingsTab: View {
             }
             .navigationTitle("Ustawienia")
         }
+    }
+}
+
+// MARK: ─── Debug Tab ─────────────────────────────────────────────────────────
+
+struct DebugTab: View {
+    @ObservedObject var engine: CameraEngine
+    @State private var splashDuration: Double = 0.7
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors:[GV.bgTop,GV.bgBottom],startPoint:.top,endPoint:.bottom).ignoresSafeArea()
+            Form {
+                // ── Splash Screen ────────────────────────────────────────
+                Section {
+                    VStack(alignment:.leading, spacing:8) {
+                        HStack {
+                            Text("Czas wyświetlania")
+                            Spacer()
+                            Text(String(format: "%.1f s", engine.splashMinDuration))
+                                .font(.system(size:13,design:.monospaced))
+                                .foregroundStyle(GV.azure)
+                        }
+                        Slider(value: $engine.splashMinDuration, in: 0.3...5.0, step: 0.1)
+                            .tint(GV.purple)
+                        Text("Minimalna długość ekranu ładowania z logo przy starcie aplikacji.")
+                            .font(.system(size:11)).foregroundStyle(GV.muted)
+                    }.padding(.vertical,4)
+                } header: { Text("Ekran ładowania (Splash)") }
+
+                // ── OCR Diagnostics ──────────────────────────────────────
+                Section {
+                    LabeledContent("OCR FPS",value:String(format:"%.2f",engine.ocrFPS))
+                    LabeledContent("Silnik",value: "Apple Vision (.fast)")
+                    LabeledContent("Język OCR",value: "en-US")
+                    LabeledContent("Rozdzielczość",value: "1280 × 720")
+                    LabeledContent("Wykryte boxy",value:"\(engine.detectedBoxes.count)")
+                } header: { Text("Diagnostyka OCR") }
+
+                // ── Kamera ───────────────────────────────────────────────
+                Section {
+                    LabeledContent("Status",value:engine.cameraOK ? "✓ Aktywna" : "✗ Brak")
+                    LabeledContent("Obiektyw",value:engine.selectedLens.label)
+                    LabeledContent("Dostępne obiektywy",value:engine.availableLenses.map{$0.label}.joined(separator:", "))
+                    LabeledContent("Snapshot bufor",value:engine.latestJpeg != nil ? "\(engine.latestJpeg!.count / 1024) KB" : "—")
+                } header: { Text("Kamera") }
+
+                // ── Brama ────────────────────────────────────────────────
+                Section {
+                    LabeledContent("Stan",value:engine.gateState.rawValue)
+                    LabeledContent("Otwieranie",value:"\(Int(engine.openingTime))s")
+                    LabeledContent("Otwarte przez",value:"\(Int(engine.openDuration))s")
+                    LabeledContent("Zamykanie",value:"\(Int(engine.closingTime))s")
+                    LabeledContent("Min. głosów",value:"\(engine.minVotes)")
+                    LabeledContent("Okno głosowania",value:"\(engine.voteWindowSize) klatek")
+                } header: { Text("Brama") }
+
+                // ── Głosowanie — test ────────────────────────────────────
+                Section {
+                    Button {
+                        engine.triggerOpen()
+                    } label: {
+                        Label("Test: otwórz bramę", systemImage:"door.open.fill")
+                            .foregroundStyle(GV.lime)
+                    }
+                    Button {
+                        engine.triggerClose()
+                    } label: {
+                        Label("Test: zamknij bramę", systemImage:"door.closed.fill")
+                            .foregroundStyle(GV.orange)
+                    }
+                } header: { Text("Testy") }
+
+                // ── Baza danych ──────────────────────────────────────────
+                Section {
+                    let logCount = (try? Database.shared.fetchLog(limit: 1000).count) ?? 0
+                    LabeledContent("Wpisów w logach",value:"\(logCount)")
+                    Button(role:.destructive) {
+                        sqlite3_exec(Database.shared.rawDB,"DELETE FROM access_log",nil,nil,nil)
+                        engine.liveLog.removeAll()
+                    } label: { Label("Wyczyść logi",systemImage:"trash.fill") }
+                    Button(role:.destructive) {
+                        sqlite3_exec(Database.shared.rawDB,"DELETE FROM plates WHERE plate NOT IN ('WA12345','KR99999','PO55123','GD00001')",nil,nil,nil)
+                    } label: { Label("Usuń dodane tablice (zachowaj demo)",systemImage:"minus.circle") }
+                } header: { Text("Baza danych") }
+            }
+            .scrollContentBackground(.hidden)
+        }
+        .navigationTitle("Debug")
+        .navigationBarTitleDisplayMode(.inline)
+        .preferredColorScheme(.dark)
     }
 }
