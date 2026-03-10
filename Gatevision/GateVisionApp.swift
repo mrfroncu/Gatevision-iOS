@@ -548,7 +548,11 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var gateTimer: DispatchWorkItem?; private var gateSeqId = 0
     private var lastGranted = ""; private var lastGrantTs: Date = .distantPast
     private var voteBuf: [[String]] = []; private var ocrCnt = 0; private var fpsMeasureTs = Date()
-    private let plateRE = try! NSRegularExpression(pattern:"[A-Z]{1,3}\\d{3,5}[A-Z]{0,2}")
+    private let plateRE = try! NSRegularExpression(
+        // Polskie tablice: 1-3 litery + 1-5 cyfr + 0-5 liter końcowych
+        // Obsługuje: WA12345, W1MWMMB, KR123AB, PO1ABC, GD00001 itp.
+        pattern: "^[A-Z]{1,3}\\d{1,5}[A-Z]{0,5}$"
+    )
 
     override init() {
         super.init()
@@ -680,7 +684,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         for (text, conf) in texts {
             for tok in text.components(separatedBy:.whitespaces) {
                 let t = tok.uppercased().filter { $0.isLetter || $0.isNumber }
-                guard t.count >= 2 else { continue }
+                guard t.count >= 3 else { continue }
                 let e = LogEntry(id:Int64(Date().timeIntervalSince1970*1000)&0x7FFFFFFF,
                     plate:t,rawOcr:t,ownerName:"",timestamp:ts(),
                     confidence:conf*100,granted:false,blocked:false,isFleet:false,isFreeMode:true)
@@ -1657,9 +1661,9 @@ struct DebugTab: View {
                 // ── OCR Diagnostics ──────────────────────────────────────
                 Section {
                     LabeledContent("OCR FPS",value:String(format:"%.2f",engine.ocrFPS))
-                    LabeledContent("Silnik",value: "Apple Vision (.fast)")
-                    LabeledContent("Język OCR",value: "en-US")
-                    LabeledContent("Rozdzielczość",value: "1280 × 720")
+                    LabeledContent("Silnik",value:"Apple Vision (.fast)")
+                    LabeledContent("Język OCR",value:"en-US")
+                    LabeledContent("Rozdzielczość",value:"1280 × 720")
                     LabeledContent("Wykryte boxy",value:"\(engine.detectedBoxes.count)")
                 } header: { Text("Diagnostyka OCR") }
 
