@@ -113,6 +113,8 @@ final class Database {
     static let shared = Database()
     private(set) var rawDB: OpaquePointer?
     private var db: OpaquePointer? { rawDB }
+    // Wszystkie operacje SQLite przez jeden szeregowy wątek — eliminuje crash przy concurrent access
+    let dbQueue = DispatchQueue(label: "gv.db", qos: .userInitiated)
 
     private init() {
         let url = FileManager.default.urls(for:.documentDirectory, in:.userDomainMask)[0]
@@ -148,13 +150,18 @@ final class Database {
 
     private func col(_ s: OpaquePointer, _ i: Int32) -> String { String(cString: sqlite3_column_text(s,i)) }
 
-    func fetchPlates(query q: String = "") -> [PlateEntry] {
+    private func _fetchPlatesRaw(query q: String) -> [PlateEntry] {
         let sql = q.isEmpty ? "SELECT id,plate,owner_name,is_fleet,blocked,notes,created_at FROM plates ORDER BY id DESC"
                             : "SELECT id,plate,owner_name,is_fleet,blocked,notes,created_at FROM plates WHERE plate LIKE '%\(q)%' OR owner_name LIKE '%\(q)%' ORDER BY id DESC"
         return query(sql) { s in PlateEntry(id:sqlite3_column_int64(s,0),plate:col(s,1),ownerName:col(s,2),notes:col(s,5),createdAt:col(s,6),isFleet:sqlite3_column_int(s,3) != 0,blocked:sqlite3_column_int(s,4) != 0) }
     }
 
+    func fetchPlates(query q: String = "") -> [PlateEntry] {
+        dbQueue.sync { _fetchPlatesRaw(query: q) }
+    }
+
     @discardableResult func addPlate(_ p: PlateEntry) -> Bool {
+        dbQueue.sync {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db,"INSERT OR IGNORE INTO plates(plate,owner_name,is_fleet,blocked,notes) VALUES(?,?,?,?,?)",-1,&stmt,nil)==SQLITE_OK else { return false }
         sqlite3_bind_text(stmt,1,(p.plate as NSString).utf8String,-1,nil)
@@ -162,49 +169,58 @@ final class Database {
         sqlite3_bind_int(stmt,3,p.isFleet ? 1:0); sqlite3_bind_int(stmt,4,p.blocked ? 1:0)
         sqlite3_bind_text(stmt,5,(p.notes as NSString).utf8String,-1,nil)
         let ok = sqlite3_step(stmt)==SQLITE_DONE; sqlite3_finalize(stmt); return ok
+        }
     }
 
     func updatePlate(_ p: PlateEntry) {
+        dbQueue.sync {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db,"UPDATE plates SET owner_name=?,is_fleet=?,blocked=?,notes=? WHERE id=?",-1,&stmt,nil)==SQLITE_OK else { return }
         sqlite3_bind_text(stmt,1,(p.ownerName as NSString).utf8String,-1,nil)
         sqlite3_bind_int(stmt,2,p.isFleet ? 1:0); sqlite3_bind_int(stmt,3,p.blocked ? 1:0)
         sqlite3_bind_text(stmt,4,(p.notes as NSString).utf8String,-1,nil)
         sqlite3_bind_int64(stmt,5,p.id); sqlite3_step(stmt); sqlite3_finalize(stmt)
+        }
     }
 
-    func deletePlate(id: Int64) { exec("DELETE FROM plates WHERE id=\(id)") }
+    func deletePlate(id: Int64) { dbQueue.sync { _ = exec("DELETE FROM plates WHERE id=\(id)") } }
 
     @discardableResult func toggleBlock(id: Int64) -> Bool {
-        exec("UPDATE plates SET blocked=CASE WHEN blocked=1 THEN 0 ELSE 1 END WHERE id=\(id)")
-        return query("SELECT blocked FROM plates WHERE id=\(id)") { sqlite3_column_int($0,0) != 0 }.first ?? false
+        dbQueue.sync {
+            exec("UPDATE plates SET blocked=CASE WHEN blocked=1 THEN 0 ELSE 1 END WHERE id=\(id)")
+            return query("SELECT blocked FROM plates WHERE id=\(id)") { sqlite3_column_int($0,0) != 0 }.first ?? false
+        }
     }
 
     func findPlate(_ s: String) -> PlateEntry? {
         let clean = s.uppercased().filter { $0.isLetter || $0.isNumber }
-        let all = fetchPlates()
+        // fetchPlates już przez dbQueue.sync — wywołaj bezpośrednio SQL bez podwójnego lock
+        let all = dbQueue.sync { _fetchPlatesRaw(query: "") }
         return all.first { clean == $0.plate || clean.contains($0.plate) }
     }
 
     @discardableResult func logAccess(plate: String, raw: String, conf: Double, granted: Bool, blocked: Bool, owner: String, fleet: Bool, snapshot: Data? = nil) -> Int64 {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db,"INSERT INTO access_log(plate,raw_ocr,confidence,granted,blocked,owner_name,is_fleet,snapshot_jpeg) VALUES(?,?,?,?,?,?,?,?)",-1,&stmt,nil)==SQLITE_OK else { return 0 }
-        sqlite3_bind_text(stmt,1,(plate as NSString).utf8String,-1,nil)
-        sqlite3_bind_text(stmt,2,(raw as NSString).utf8String,-1,nil)
-        sqlite3_bind_double(stmt,3,conf)
-        sqlite3_bind_int(stmt,4,granted ? 1:0); sqlite3_bind_int(stmt,5,blocked ? 1:0)
-        sqlite3_bind_text(stmt,6,(owner as NSString).utf8String,-1,nil)
-        sqlite3_bind_int(stmt,7,fleet ? 1:0)
-        if let jpeg = snapshot {
-            jpeg.withUnsafeBytes { sqlite3_bind_blob(stmt, 8, $0.baseAddress, Int32($0.count), nil) }
-        } else {
-            sqlite3_bind_null(stmt, 8)
+        dbQueue.sync {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db,"INSERT INTO access_log(plate,raw_ocr,confidence,granted,blocked,owner_name,is_fleet,snapshot_jpeg) VALUES(?,?,?,?,?,?,?,?)",-1,&stmt,nil)==SQLITE_OK else { return 0 }
+            sqlite3_bind_text(stmt,1,(plate as NSString).utf8String,-1,nil)
+            sqlite3_bind_text(stmt,2,(raw as NSString).utf8String,-1,nil)
+            sqlite3_bind_double(stmt,3,conf)
+            sqlite3_bind_int(stmt,4,granted ? 1:0); sqlite3_bind_int(stmt,5,blocked ? 1:0)
+            sqlite3_bind_text(stmt,6,(owner as NSString).utf8String,-1,nil)
+            sqlite3_bind_int(stmt,7,fleet ? 1:0)
+            if let jpeg = snapshot {
+                _ = jpeg.withUnsafeBytes { sqlite3_bind_blob(stmt, 8, $0.baseAddress, Int32($0.count), nil) }
+            } else {
+                sqlite3_bind_null(stmt, 8)
+            }
+            sqlite3_step(stmt); sqlite3_finalize(stmt)
+            return sqlite3_last_insert_rowid(db)
         }
-        sqlite3_step(stmt); sqlite3_finalize(stmt)
-        return sqlite3_last_insert_rowid(db)
     }
 
     func fetchLog(query q: String = "", limit: Int = 200) -> [LogEntry] {
+        dbQueue.sync {
         // BLOB nie ładujemy tu — za ciężkie przy 200 wpisach. Używamy fetchSnapshot(id:) osobno.
         let sql = q.isEmpty
             ? "SELECT id,plate,raw_ocr,confidence,granted,blocked,owner_name,is_fleet,timestamp,(snapshot_jpeg IS NOT NULL) as has_snap FROM access_log ORDER BY id DESC LIMIT \(limit)"
@@ -218,20 +234,23 @@ final class Database {
                 isFleet:sqlite3_column_int(s,7) != 0,isFreeMode:false,
                 snapshotData: hasSnap ? Data([1]) : nil)  // marker — thumbnail ładuje lazy
         }
+        } // dbQueue.sync
     }
 
-    func clearLog() { exec("DELETE FROM access_log") }
+    func clearLog() { dbQueue.sync { _ = exec("DELETE FROM access_log") } }
 
     func fetchSnapshot(logId: Int64) -> Data? {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db,"SELECT snapshot_jpeg FROM access_log WHERE id=?",-1,&stmt,nil)==SQLITE_OK else { return nil }
-        sqlite3_bind_int64(stmt,1,logId)
-        guard sqlite3_step(stmt)==SQLITE_ROW else { sqlite3_finalize(stmt); return nil }
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_column_type(stmt,0) != SQLITE_NULL else { return nil }
-        let bytes = sqlite3_column_bytes(stmt,0)
-        guard bytes > 0, let ptr = sqlite3_column_blob(stmt,0) else { return nil }
-        return Data(bytes: ptr, count: Int(bytes))
+        dbQueue.sync {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db,"SELECT snapshot_jpeg FROM access_log WHERE id=?",-1,&stmt,nil)==SQLITE_OK else { return nil }
+            sqlite3_bind_int64(stmt,1,logId)
+            guard sqlite3_step(stmt)==SQLITE_ROW else { sqlite3_finalize(stmt); return nil }
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_column_type(stmt,0) != SQLITE_NULL else { return nil }
+            let bytes = sqlite3_column_bytes(stmt,0)
+            guard bytes > 0, let ptr = sqlite3_column_blob(stmt,0) else { return nil }
+            return Data(bytes: ptr, count: Int(bytes))
+        }
     }
 }
 
@@ -292,7 +311,7 @@ final class WebServer: ObservableObject {
     }
 
     private func sendNextFrame(conn: NWConnection, boundary: String) {
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.2) { [weak self, weak conn] in
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.05) { [weak self, weak conn] in
             guard let self, let conn else { return }
             let jpeg = self.engine?.latestJpeg
             let frameData = jpeg ?? self.placeholderJpeg()
@@ -509,7 +528,9 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // Najnowsza klatka jako JPEG + boxy wykrytych tablic (dla /api/snapshot i /api/stream)
     var latestJpeg: Data? = nil
     var detectedBoxes: [CGRect] = []
-    private let jpegLock = NSLock()
+    private let jpegLock  = NSLock()
+    private let jpegQ     = DispatchQueue(label:"gv.jpeg", qos:.utility)
+    private let ciContext = CIContext(options:[.useSoftwareRenderer: false])  // GPU, singleton
     @Published var selectedLens: LensType = .wide  { didSet { switchLens(to: selectedLens) } }
     @Published var availableLenses: [LensType] = []
     @Published var openDuration = 10.0
@@ -555,7 +576,8 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             videoOut.alwaysDiscardsLateVideoFrames = true
             if session.canAddOutput(videoOut) { session.addOutput(videoOut) }
         }
-        videoOut.connection(with:.video)?.videoRotationAngle = 90
+        // NIE ustawiamy videoRotationAngle — CVPixelBuffer zostawia surowe piksele (landscape)
+        // Rotacja aplikowana ręcznie w jpegQ na CIImage
         session.commitConfiguration(); if !session.isRunning { session.startRunning() }
         DispatchQueue.main.async { self.cameraOK = true }
     }
@@ -593,32 +615,41 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             }
         }
         req.recognitionLevel = .fast; req.usesLanguageCorrection = false; req.recognitionLanguages = ["en-US"]
-        try? VNImageRequestHandler(cvPixelBuffer: px).perform([req])
+        // Bufor z tylnej kamery (portret) = landscape piksele, tekst jest obrócony 90° CW
+        // .right = "obraz jest obrócony 90° CW od naturalnej orientacji" → Vision wyprostowuje przed OCR
+        try? VNImageRequestHandler(cvPixelBuffer: px, orientation: .right).perform([req])
 
-        // Zapisz JPEG co ~10 klatek (~3 fps dla streamu webowego)
-        guard ocrCnt % 10 == 0 else { return }
-        // Obróć CIImage o 90° zgodnie z ruchem wskazówek zegara (kamera pionowa → landscape dla web)
-        // i zastosuj poziomy flip by usunąć efekt lustrzany
-        let ciRaw = CIImage(cvPixelBuffer: px)
-        let ciRotated = ciRaw
-            .transformed(by: CGAffineTransform(rotationAngle: -.pi / 2))   // -90° = obrót w prawo
-            .transformed(by: CGAffineTransform(scaleX: -1, y: 1)           // flip poziomy — usuwa mirror
-                .concatenating(CGAffineTransform(translationX: ciRaw.extent.height, y: 0)))
-        let context = CIContext()
-        let rotatedExtent = ciRotated.extent
-        guard let cgImage = context.createCGImage(ciRotated, from: rotatedExtent) else { return }
-        let outSize = CGSize(width: rotatedExtent.width, height: rotatedExtent.height)
+        // Zapisz JPEG co ~3 klatki (~10fps dla streamu webowego)
+        guard ocrCnt % 3 == 0 else { return }
 
-        // Narysuj boxy wykrytych tablic
+        // Kopia pixel buffer reference dla async processing
+        let pxCopy = px
         jpegLock.lock()
         let boxes = detectedBoxes
         jpegLock.unlock()
 
-        let uiImage = drawBoxes(on: cgImage, boxes: boxes, size: outSize)
-        if let jpeg = uiImage.jpegData(compressionQuality: 0.6) {
-            jpegLock.lock()
-            latestJpeg = jpeg
-            jpegLock.unlock()
+        jpegQ.async { [weak self] in
+            guard let self else { return }
+            let ciRaw = CIImage(cvPixelBuffer: pxCopy)
+            let h = ciRaw.extent.height  // 720 (potrzebne do translacji po rotacji)
+            // Tylna kamera w portrecie: CVPixelBuffer = landscape (góra obrazu = prawy bok)
+            // +pi/2 (90° CW) wyprostowuje: (x,y)→(-y,x), translacja (h,0) przywraca do ćwiartki +
+            // Obrót +90° CW: (x,y)→(-y,x), translacja (h,0) → obraz wyprostowany ale mirrored
+            // Flip poziomy: scaleX=-1 z translacją (nowa_szerokość=h, 0) → usuwa mirror
+            let rotation = CGAffineTransform(rotationAngle: .pi / 2)
+                .concatenating(CGAffineTransform(translationX: h, y: 0))
+            let flipped = CGAffineTransform(scaleX: -1, y: 1)
+                .concatenating(CGAffineTransform(translationX: h, y: 0))
+            let ciRotated = ciRaw.transformed(by: rotation).transformed(by: flipped)
+            let extent = ciRotated.extent
+            guard let cgImage = self.ciContext.createCGImage(ciRotated, from: extent) else { return }
+            let outSize = CGSize(width: extent.width, height: extent.height)
+            let uiImage = self.drawBoxes(on: cgImage, boxes: boxes, size: outSize)
+            if let jpeg = uiImage.jpegData(compressionQuality: 0.55) {
+                self.jpegLock.lock()
+                self.latestJpeg = jpeg
+                self.jpegLock.unlock()
+            }
         }
     }
 
@@ -690,16 +721,33 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let matched = row?.plate ?? plate
         let granted = row != nil && !(row!.blocked)
         let blocked = row?.blocked ?? false
-        // Snapshot tylko gdy dostęp przyznany (brama się otworzy)
-        jpegLock.lock()
-        let snap: Data? = granted ? latestJpeg : nil
-        jpegLock.unlock()
-        let logId = Database.shared.logAccess(plate:matched,raw:plate,conf:99,granted:granted,blocked:blocked,owner:row?.ownerName ?? "",fleet:row?.isFleet ?? false,snapshot:snap)
-        let entry = LogEntry(id:logId,plate:matched,rawOcr:plate,ownerName:row?.ownerName ?? "",timestamp:ts(),confidence:99,granted:granted,blocked:blocked,isFleet:row?.isFleet ?? false,isFreeMode:false,snapshotData:snap)
+        // Snapshot tylko gdy dostęp przyznany — bierzemy po krótkiej chwili
+        // żeby jpegQ.async zdążył przetworzyć bieżącą klatkę
+        let captureTs = ts()
         DispatchQueue.main.async {
-            self.lastPlate = matched; self.liveLog.insert(entry,at:0)
-            if self.liveLog.count > 100 { self.liveLog.removeLast() }
+            self.lastPlate = matched
             if granted { self.triggerOpen() }
+        }
+        if granted {
+            jpegQ.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                guard let self else { return }
+                self.jpegLock.lock()
+                let snap = self.latestJpeg
+                self.jpegLock.unlock()
+                let logId = Database.shared.logAccess(plate:matched,raw:plate,conf:99,granted:true,blocked:false,owner:row?.ownerName ?? "",fleet:row?.isFleet ?? false,snapshot:snap)
+                let entry = LogEntry(id:logId,plate:matched,rawOcr:plate,ownerName:row?.ownerName ?? "",timestamp:captureTs,confidence:99,granted:true,blocked:false,isFleet:row?.isFleet ?? false,isFreeMode:false,snapshotData:snap != nil ? Data([1]) : nil)
+                DispatchQueue.main.async {
+                    self.liveLog.insert(entry, at:0)
+                    if self.liveLog.count > 100 { self.liveLog.removeLast() }
+                }
+            }
+        } else {
+            let logId = Database.shared.logAccess(plate:matched,raw:plate,conf:99,granted:false,blocked:blocked,owner:row?.ownerName ?? "",fleet:row?.isFleet ?? false,snapshot:nil)
+            let entry = LogEntry(id:logId,plate:matched,rawOcr:plate,ownerName:row?.ownerName ?? "",timestamp:captureTs,confidence:99,granted:false,blocked:blocked,isFleet:row?.isFleet ?? false,isFreeMode:false,snapshotData:nil)
+            DispatchQueue.main.async {
+                self.liveLog.insert(entry, at:0)
+                if self.liveLog.count > 100 { self.liveLog.removeLast() }
+            }
         }
     }
 
@@ -907,7 +955,7 @@ struct SplashScreen: View {
     }
 
     private func completeStep(_ step: LoadStep) {
-        withAnimation(.spring(duration: 0.4)) {
+        _ = withAnimation(.spring(duration: 0.4)) {
             completedSteps.insert(step)
         }
         // Advance currentStep label
@@ -1651,7 +1699,7 @@ struct DebugTab: View {
 
                 // ── Baza danych ──────────────────────────────────────────
                 Section {
-                    let logCount = (try? Database.shared.fetchLog(limit: 1000).count) ?? 0
+                    let logCount = Database.shared.fetchLog(limit: 1000).count
                     LabeledContent("Wpisów w logach",value:"\(logCount)")
                     Button(role:.destructive) {
                         sqlite3_exec(Database.shared.rawDB,"DELETE FROM access_log",nil,nil,nil)
