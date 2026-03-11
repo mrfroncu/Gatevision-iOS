@@ -29,11 +29,11 @@
 
 ---
 
-## Co to jest?
+## Czym jest ten projekt?
 
-**GateVision** to natywna aplikacja iOS do automatycznej kontroli bramy garażowej lub parkingowej. Kamera iPhone'a w czasie rzeczywistym rozpoznaje tablice rejestracyjne używając **Apple Vision Framework** (Neural Engine), porównuje je z bazą danych i automatycznie otwiera/zamyka bramę przez GPIO.
+**GateVision** to system automatycznej kontroli bramy wjazdowej przeznaczony dla firm. Docelowym urządzeniem jest Raspberry Pi, natomiast aplikacja na iOS służy jako proof of concept. Kamera w czasie rzeczywistym rozpoznaje tablice rejestracyjne używając **Apple Vision Framework** (Neural Engine), porównuje je z bazą danych i automatycznie otwiera/zamyka bramę przez GPIO.
 
-Jednocześnie uruchamia **wbudowany serwer HTTP** (port 6600) — gotowy panel webowy dostępny z dowolnej przeglądarki w sieci lokalnej.
+W tle jest uruchomiony **serwer HTTP** (domyślnie na porcie 6600) — na którym znajduje się panel webowy dostępny do zarządzania.
 
 ```
 iPhone z GateVision
@@ -42,8 +42,7 @@ iPhone z GateVision
       │
       ├── 🔌  GPIO/przekaźnik → Sterowanie bramą fizycznie
       │
-      └── 🌐  HTTP :6600 → Panel web (ten sam co Raspberry Pi)
-                    └── Dostępny na całej sieci lokalnej WiFi
+      └── 🌐  HTTP :6600 → Panel web (dokładnie ten sam co w wersji na Raspberry Pi)
 ```
 
 ---
@@ -52,15 +51,15 @@ iPhone z GateVision
 
 | Kategoria | Opis |
 |-----------|------|
-| 🔍 **OCR w czasie rzeczywistym** | Apple Vision + Neural Engine, 8–20 FPS na iPhone 12+ |
-| 🚗 **Tryb Tablica** | Regex filtruje polskie tablice, system głosowania, cooldown 8s |
-| 📋 **Tryb Wolny** | Wyświetla każdy rozpoznany token — do kalibracji i debugowania |
-| 🔦 **Wybór obiektywu** | 0.5×, 1×, 2× — live switch bez restartu sesji |
-| 🌐 **Panel Web** | Pełny dashboard na porcie 6600 — zarządzanie z PC/tabletu |
-| 🗄️ **SQLite** | Baza danych tablic i logów dostępów wbudowana w aplikację |
-| 🔒 **Blokowanie** | Możliwość zablokowania konkretnych tablic |
-| 👥 **Flota** | Oznaczanie pojazdów flotowych |
-| 📊 **Logi** | Historia wszystkich detekcji z filtrowaniem i wyszukiwaniem |
+| 🔍 **OCR w czasie rzeczywistym** | Apple Vision + Neural Engine, 8–20 FPS od iPhone 12+ |
+| 🚗 **Tryb detekcji tablic** | Regex filtruje europejskie tablice, system "głosowania", cooldown |
+| 📋 **Tryb detekcji wszystkiego** | Wyświetla każdy rozpoznany token — do kalibracji i debugowania |
+| 🔦 **Wybór obiektywu** | 0.5×, 1×, 2× — live switch, również przez panel web |
+| 🌐 **Panel Web** | Dashboard do zarządzania |
+| 🗄️ **SQLite** | Lokalna baza danych tablic i logów dostępów wbudowana w aplikację - failover / resilience|
+| 🔒 **Blokowanie** | Możliwość zablokowania konkretnych tablic bez konieczności usuwania z systemu |
+| 👥 **Flota i AD** | Oznaczanie pojazdów flotowych i przypisywanie pojazdów do userów na domenie |
+| 📊 **Logi** | Historia wszystkich detekcji z filtrowaniem i wyszukiwaniem i klatką z momentu wjazdu (detekcji) poprawnej rejestracji|
 | ⚡ **Liquid Glass UI** | Natywny design iOS z `.ultraThinMaterial` i glow effects |
 
 ---
@@ -91,10 +90,10 @@ http://<IP-iPhone>:6600
 
 ### Zakładki panelu
 
-- **Status** — stan bramy na żywo, metryki OCR, przyciski ręcznego sterowania
+- **Status** — stan bramy na żywo, metryki OCR, przyciski ręcznego sterowania, symulacja statusów realnej bramy (bez implementacji automatyki)
 - **Logi** — tabela wszystkich detekcji z wyszukiwarką  
 - **Tablice** — CRUD: dodawanie, edycja, blokowanie tablic  
-- **Ustawienia** — tryb OCR, czasy bramy, głosowanie
+- **Ustawienia** — tryb OCR, czasy bramy, "głosowanie"
 
 ### REST API
 
@@ -117,42 +116,9 @@ http://<IP-iPhone>:6600
 ### Wymagania
 
 - Xcode 15+  
-- iPhone z iOS 16+ (fizyczne urządzenie — symulator nie ma kamery)
-- Ten sam WiFi co urządzenie zarządzające
+- iPhone z iOS 16+
+- (Opcjonalnie) Raspberry Pi jako endpoint kamery USB (testowane na Logitech C922) - iPhone służy do procesingu detekcji
 
-### Kroki
-
-**1. Utwórz projekt w Xcode**
-
-```
-File → New → Project → iOS → App
-Interface: SwiftUI
-Language: Swift
-```
-
-**2. Zastąp ContentView.swift**
-
-Skopiuj zawartość pliku `GateVisionApp.swift` do swojego projektu, zastępując `ContentView.swift`.
-
-**3. Info.plist — dodaj uprawnienia**
-
-```xml
-<key>NSCameraUsageDescription</key>
-<string>GateVision używa kamery do rozpoznawania tablic rejestracyjnych</string>
-
-<key>NSLocalNetworkUsageDescription</key>
-<string>GateVision udostępnia panel zarządzania w sieci lokalnej</string>
-```
-
-**4. Uruchom na iPhone**
-
-```
-Product → Run  (⌘R)
-```
-
-> Przy pierwszym uruchomieniu iOS poprosi o dostęp do kamery — zatwierdź.
-
----
 
 ## ⚙️ Konfiguracja
 
@@ -160,10 +126,10 @@ Product → Run  (⌘R)
 
 | Tryb | Kiedy używać |
 |------|-------------|
-| **🔍 Tablica** | Produkcja — filtruje polskie tablice, otwiera bramę |
+| **🔍 Tablica** | Produkcja — filtruje europejskie tablice, otwiera bramę |
 | **📋 Wolny** | Kalibracja — pokazuje każdy token z confidence |
 
-### System głosowania
+### System "głosowania"
 
 Przed otwarciem bramy aplikacja zbiera `minVotes` detekcji tej samej tablicy w oknie `voteWindowSize` klatek. Eliminuje fałszywe odczyty.
 
@@ -185,6 +151,8 @@ Domyślnie:      2s               10s                            3s
 ```
 
 Obsługuje: `WA12345`, `KR999`, `PO55123AB`, `GD00001` itd.
+
++ TODO: Obsługa customowych tablic
 
 ---
 
@@ -233,7 +201,7 @@ GateVision/
 │   ├── requirements.txt
 │   └── README.md
 │
-└── README.md                  # Ten plik
+└── README.md
 ```
 
 ---
@@ -244,42 +212,23 @@ GateVision/
 ┌─────────────────────────────────────────────────────┐
 │                   iPhone                            │
 │                                                     │
-│  ┌──────────────┐    ┌─────────────────────────┐   │
+│  ┌──────────────┐    ┌─────────────────────────┐    │
 │  │ AVFoundation │───▶│    CameraEngine          │   │
 │  │  (kamera)    │    │  • VNRecognizeTextReq    │   │
 │  └──────────────┘    │  • Vote buffer           │   │
 │                      │  • Gate state machine    │   │
 │  ┌──────────────┐    │  • SQLite logging        │   │
 │  │   SwiftUI    │◀───│                          │   │
-│  │  (Liquid     │    └──────────┬──────────────┘   │
+│  │  (Liquid     │    └──────────┬──────────────┘    │
 │  │   Glass UI)  │               │                   │
-│  └──────────────┘    ┌──────────▼──────────────┐   │
-│                      │      WebServer           │   │
-│  WiFi ─────────────▶│  NWListener :6600        │   │
-│                      │  • REST API              │   │
-│                      │  • HTML dashboard        │   │
-│                      └─────────────────────────┘   │
+│  └──────────────┘    ┌──────────▼──────────────┐    │
+│                      │      WebServer          │    │
+│  WiFi ─────────────▶ │  NWListener :6600        │   │ 
+│                      │  • REST API             │    │ 
+│                      │  • HTML dashboard       │    │
+│                      └─────────────────────────┘    │
 └─────────────────────────────────────────────────────┘
 ```
-
----
-
-## 🧪 Testowanie OCR
-
-### Tryb Wolny do kalibracji
-
-1. Ustaw **Tryb OCR → Wolny** w Ustawieniach
-2. Skieruj kamerę na tablicę
-3. Obserwuj zakładkę **Logi → Na żywo** — każdy token z confidence %
-4. Tokeny ≥ 80% (zielone) → wysokie prawdopodobieństwo poprawnego odczytu
-5. Gdy wyniki są dobre — przełącz z powrotem na **Tryb Tablica**
-
-### Dobre ustawienia kamery
-
-- Odległość: 3–8 metrów od tablicy
-- Oświetlenie: jasne, bez oślepiającego kontrasту
-- Obiektyw: `2×` (telephoto) dla dalszych tablic, `1×` dla bliskich
-- Kąt: możliwie prostopadły do tablicy
 
 ---
 
@@ -287,10 +236,11 @@ GateVision/
 
 Pull requesty mile widziane! W szczególności:
 
-- 🇵🇱 Ulepszenia regex dla niestandardowych formatów tablic
-- 🔌 Implementacja GPIO przez network relay (dla iOS → Pi bridge)
-- 🌍 Internacjonalizacja (tablice z innych krajów)
-- 📷 Obsługa zewnętrznych kamer IP (RTSP stream)
+- Ulepszenia regex dla niestandardowych formatów tablic
+- Implementacja GPIO przez network relay (dla iOS → Pi bridge)
+- Internacjonalizacja (tablice z innych krajów)
+- Obsługa zewnętrznych kamer IP (RTSP stream)
+- Optymalizacja wersji Pi
 
 ---
 
