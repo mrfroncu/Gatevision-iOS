@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import AVFoundation
 import Vision
+import CoreML
 import SQLite3
 import Network
 import Darwin.POSIX.netdb
@@ -22,9 +23,9 @@ enum GateState: String, CaseIterable {
     }
     var sfSymbol: String {
         switch self {
-        case .closed:  "door.closed.fill"
+        case .closed:  "door.left.hand.closed"
         case .opening: "arrow.up.circle.fill"
-        case .open:    "door.open.fill"
+        case .open:    "door.left.hand.open"
         case .closing: "arrow.down.circle.fill"
         }
     }
@@ -52,6 +53,37 @@ enum OCRMode: String, CaseIterable, Identifiable {
     var description: String {
         self == .plate ? "Filtruje tablice, otwiera bramę automatycznie."
                        : "Wyświetla cały tekst bez filtra — do kalibracji."
+    }
+}
+
+enum DetectionMode: String, CaseIterable, Identifiable {
+    case visionOCR, rectangleDetection, coreMLYOLO
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .visionOCR:          return "Pełna klatka"
+        case .rectangleDetection: return "Prostokąty"
+        case .coreMLYOLO:         return "YOLO ML"
+        }
+    }
+    var description: String {
+        switch self {
+        case .visionOCR:          return "OCR na pełnej klatce — obecne zachowanie."
+        case .rectangleDetection: return "Wykrywa prostokąty tablic, potem OCR na wycinku."
+        case .coreMLYOLO:         return "Model CoreML YOLO do detekcji tablic, potem OCR."
+        }
+    }
+}
+
+enum CameraSource: String, CaseIterable, Identifiable {
+    case iphone, raspberryPi, seventyMai
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .iphone:      return "📱 iPhone"
+        case .raspberryPi: return "🎥 Raspberry Pi"
+        case .seventyMai:  return "🚗 70mai"
+        }
     }
 }
 
@@ -254,6 +286,48 @@ final class Database {
     }
 }
 
+// MARK: ─── Pi Stream Delegate ────────────────────────────────────────────────
+
+/// Parsuje multipart/x-mixed-replace MJPEG stream z Raspberry Pi
+final class PiStreamDelegate: NSObject, URLSessionDataDelegate {
+    weak var engine: CameraEngine?
+    private var buffer = Data()
+    private let boundary = Data("--gvframe".utf8)
+    private let jpegStart = Data([0xFF, 0xD8])
+    private let jpegEnd   = Data([0xFF, 0xD9])
+
+    init(engine: CameraEngine) { self.engine = engine }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        completionHandler(.allow)
+        DispatchQueue.main.async { self.engine?.piConnected = true; self.engine?.cameraOK = true }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        buffer.append(data)
+        // Szukaj kompletnych JPEG (FF D8 ... FF D9)
+        var searchRange = buffer.startIndex..<buffer.endIndex
+        while true {
+            guard let startRange = buffer.range(of: jpegStart, in: searchRange) else { break }
+            guard let endRange   = buffer.range(of: jpegEnd,   in: startRange.upperBound..<buffer.endIndex) else { break }
+            let jpegData = buffer[startRange.lowerBound...endRange.upperBound - 1]
+            engine?.handlePiFrame(Data(jpegData))
+            searchRange = endRange.upperBound..<buffer.endIndex
+            // Wyczyść przetworzony bufor
+            buffer = Data(buffer[searchRange])
+            searchRange = buffer.startIndex..<buffer.endIndex
+        }
+        // Ogranicz bufor do 2MB żeby nie rosnął bez końca
+        if buffer.count > 2_000_000 { buffer = Data() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        DispatchQueue.main.async { self.engine?.piConnected = false; self.engine?.cameraOK = false }
+        engine?.retryPiConnection()
+    }
+}
+
 // MARK: ─── Web Server ─────────────────────────────────────────────────────────
 
 final class WebServer: ObservableObject {
@@ -373,6 +447,7 @@ final class WebServer: ObservableObject {
             status["last_raw"]         = e?.lastRaw ?? ""
             status["ocr_fps"]          = e?.ocrFPS ?? 0
             status["ocr_mode"]         = e?.ocrMode.rawValue ?? "plate"
+            status["detection_mode"]   = e?.detectionMode.rawValue ?? "visionOCR"
             status["selected_lens"]    = e?.selectedLens.rawValue ?? "wide"
             status["available_lenses"] = e?.availableLenses.map { $0.rawValue } ?? ["wide"]
             status["engine"]           = "Apple Vision"
@@ -453,6 +528,8 @@ final class WebServer: ObservableObject {
             guard let e else { return (200,"application/json",j([:])) }
             return (200, "application/json", j([
                 "ocr_mode":          e.ocrMode.rawValue,
+                "detection_mode":    e.detectionMode.rawValue,
+                "yolo_model_loaded": e.yoloModelAvailable,
                 "selected_lens":     e.selectedLens.rawValue,
                 "available_lenses":  e.availableLenses.map { $0.rawValue },
                 "min_votes":         e.minVotes,
@@ -466,6 +543,7 @@ final class WebServer: ObservableObject {
             guard let obj = jParse(body), let e else { return (400,"application/json",j(["error":"bad request"])) }
             DispatchQueue.main.async {
                 if let v = obj["ocr_mode"] as? String { e.ocrMode = OCRMode(rawValue:v) ?? .plate }
+                if let v = obj["detection_mode"] as? String { e.detectionMode = DetectionMode(rawValue:v) ?? .visionOCR }
                 if let v = obj["selected_lens"] as? String, let lens = LensType(rawValue:v), e.availableLenses.contains(lens) { e.selectedLens = lens }
                 if let v = obj["min_votes"] as? Int { e.minVotes = v }
                 if let v = obj["vote_window"] as? Int { e.voteWindowSize = v }
@@ -525,6 +603,20 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     @Published var cameraOK    = false
     @Published var ocrMode:    OCRMode   = .plate { didSet { _ocrModeSafe = ocrMode } }
 
+    // ── Tryb detekcji tablic ──────────────────────────────────────────
+    @Published var detectionMode: DetectionMode = .visionOCR {
+        didSet {
+            _detectionModeSafe = detectionMode
+            UserDefaults.standard.set(detectionMode.rawValue, forKey: "detectionMode")
+        }
+    }
+    private var _detectionModeSafe: DetectionMode = .visionOCR
+
+    // ── CoreML YOLO model ─────────────────────────────────────────────
+    private var yoloModel: VNCoreMLModel?
+    private var yoloModelLoaded = false
+    @Published var yoloModelAvailable = false
+
     // Najnowsza klatka jako JPEG + boxy wykrytych tablic (dla /api/snapshot i /api/stream)
     var latestJpeg: Data? = nil
     var detectedBoxes: [CGRect] = []
@@ -541,6 +633,39 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         didSet { UserDefaults.standard.set(splashMinDuration, forKey: "splashMinDuration") }
     }
 
+    // ── Zdalne źródło kamery (Raspberry Pi) ──────────────────────────
+    @Published var cameraSource: CameraSource = CameraSource(rawValue: UserDefaults.standard.string(forKey: "cameraSource") ?? "") ?? .iphone {
+        didSet {
+            UserDefaults.standard.set(cameraSource.rawValue, forKey: "cameraSource")
+            applyCameraSource()
+        }
+    }
+    @Published var piAddress: String = UserDefaults.standard.string(forKey: "piAddress") ?? "192.168.1.100" {
+        didSet { UserDefaults.standard.set(piAddress, forKey: "piAddress") }
+    }
+    @Published var piConnected = false
+    @Published var piFPS: Double = 0
+
+    // ── 70mai RTSP ────────────────────────────────────────────────────────────
+    @Published var maiRtspURL: String = UserDefaults.standard.string(forKey: "maiRtspURL") ?? "rtsp://192.168.0.1:554" {
+        didSet { UserDefaults.standard.set(maiRtspURL, forKey: "maiRtspURL") }
+    }
+    @Published var maiConnected = false
+    @Published var maiFPS: Double = 0
+
+    private var piTask: URLSessionDataTask?
+    private var piBuffer = Data()
+    private var piFPSCnt = 0
+    private var piFPSTs  = Date()
+    private let piQ = DispatchQueue(label: "gv.pi", qos: .userInitiated)
+
+    private var maiPlayer: AVPlayer?
+    private var maiOutput: AVPlayerItemVideoOutput?
+    private var maiDisplayLink: CADisplayLink?
+    private var maiFPSCnt = 0
+    private var maiFPSTs  = Date()
+    private let maiQ = DispatchQueue(label: "gv.mai", qos: .userInitiated)
+
     private var _ocrModeSafe: OCRMode = .plate
     private let session = AVCaptureSession(); private let videoOut = AVCaptureVideoDataOutput()
     private let sessionQ = DispatchQueue(label:"gv.sess", qos:.userInitiated)
@@ -556,13 +681,265 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
     override init() {
         super.init()
+        // Odczytaj tryb detekcji z UserDefaults
+        if let saved = UserDefaults.standard.string(forKey: "detectionMode"),
+           let mode = DetectionMode(rawValue: saved) {
+            detectionMode = mode
+            _detectionModeSafe = mode
+        }
+        loadYOLOModelIfNeeded()
         let avail = LensType.allCases.filter { AVCaptureDevice.default($0.deviceType, for:.video, position:.back) != nil }
         DispatchQueue.main.async { self.availableLenses = avail }
-        sessionQ.async { self._startSession(lens: .wide) }
+        switch cameraSource {
+        case .iphone:
+            sessionQ.async { self._startSession(lens: .wide) }
+        case .raspberryPi:
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.startPiStream() }
+        case .seventyMai:
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.startMaiStream() }
+        }
     }
 
-    func switchLens(to lens: LensType) { ocrCnt = 0; fpsMeasureTs = Date(); sessionQ.async { self._startSession(lens:lens) } }
+    func switchLens(to lens: LensType) {
+        guard cameraSource == .iphone else { return }
+        ocrCnt = 0; fpsMeasureTs = Date(); sessionQ.async { self._startSession(lens:lens) }
+    }
     var captureSession: AVCaptureSession { session }
+
+    // ── Raspberry Pi MJPEG stream ─────────────────────────────────────────────
+
+    func applyCameraSource() {
+        // Zatrzymaj wszystkie źródła
+        stopPiStream()
+        stopMaiStream()
+        sessionQ.async { [weak self] in self?.session.stopRunning() }
+        DispatchQueue.main.async {
+            self.cameraOK = false
+            self.piConnected = false; self.piFPS = 0
+            self.maiConnected = false; self.maiFPS = 0
+        }
+        switch cameraSource {
+        case .iphone:
+            sessionQ.async { self._startSession(lens: self.selectedLens) }
+        case .raspberryPi:
+            startPiStream()
+        case .seventyMai:
+            startMaiStream()
+        }
+    }
+
+    func startPiStream() {
+        stopPiStream()
+        let urlStr = "http://\(piAddress):6600/api/stream"
+        guard let url = URL(string: urlStr) else { return }
+        DispatchQueue.main.async { self.piConnected = false }
+        let session = URLSession(configuration: .default)
+        let task = session.dataTask(with: url) { [weak self] _, _, error in
+            guard let self else { return }
+            if error != nil {
+                DispatchQueue.main.async { self.piConnected = false }
+            }
+        }
+        // Użyj streaming delegate zamiast completion
+        let streamSession = URLSession(configuration: .default, delegate: PiStreamDelegate(engine: self), delegateQueue: nil)
+        let streamTask = streamSession.dataTask(with: URLRequest(url: url))
+        piTask = streamTask
+        piBuffer = Data()
+        streamTask.resume()
+        _ = task  // suppress warning
+    }
+
+    func stopPiStream() {
+        piTask?.cancel()
+        piTask = nil
+        piBuffer = Data()
+    }
+
+    func retryPiConnection() {
+        guard cameraSource == .raspberryPi else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.cameraSource == .raspberryPi, !self.piConnected else { return }
+            self.startPiStream()
+        }
+    }
+
+    // ── 70mai RTSP stream przez AVPlayer ──────────────────────────────────────
+
+    func startMaiStream() {
+        stopMaiStream()
+        guard let url = URL(string: maiRtspURL) else {
+            DispatchQueue.main.async { self.maiConnected = false }
+            return
+        }
+        DispatchQueue.main.async { self.maiConnected = false; self.cameraOK = false }
+
+        let asset = AVURLAsset(url: url)
+        let item  = AVPlayerItem(asset: asset)
+
+        // AVPlayerItemVideoOutput — wyciągamy klatki przez CADisplayLink
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: outputSettings)
+        item.add(output)
+
+        let player = AVPlayer(playerItem: item)
+        player.isMuted = true
+        player.play()
+
+        maiPlayer = player
+        maiOutput = output
+        maiFPSCnt = 0
+        maiFPSTs  = Date()
+
+        // CADisplayLink — poll klatek w 10fps na głównym wątku, przetwarzanie async
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let dl = CADisplayLink(target: self, selector: #selector(self._maiTick))
+            dl.preferredFrameRateRange = CAFrameRateRange(minimum: 5, maximum: 15, preferred: 10)
+            dl.add(to: .main, forMode: .common)
+            self.maiDisplayLink = dl
+        }
+
+        // Sprawdź połączenie po 5s
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, self.cameraSource == .seventyMai else { return }
+            if !self.maiConnected { self.retryMaiConnection() }
+        }
+    }
+
+    func stopMaiStream() {
+        maiDisplayLink?.invalidate()
+        maiDisplayLink = nil
+        maiPlayer?.pause()
+        maiPlayer = nil
+        maiOutput = nil
+    }
+
+    func retryMaiConnection() {
+        guard cameraSource == .seventyMai else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, self.cameraSource == .seventyMai, !self.maiConnected else { return }
+            self.startMaiStream()
+        }
+    }
+
+    @objc private func _maiTick(_ dl: CADisplayLink) {
+        guard let output = maiOutput, let player = maiPlayer else { return }
+
+        // Sprawdź czy player jest gotowy
+        guard player.status == .readyToPlay,
+              player.currentItem?.status == .readyToPlay else {
+            // Jeszcze nie gotowy
+            if !maiConnected {
+                let status = player.currentItem?.status
+                if status == .failed {
+                    maiDisplayLink?.invalidate()
+                    maiDisplayLink = nil
+                    retryMaiConnection()
+                }
+            }
+            return
+        }
+
+        let time = output.itemTime(forHostTime: CACurrentMediaTime())
+        guard output.hasNewPixelBuffer(forItemTime: time),
+              let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil)
+        else { return }
+
+        // Połączono!
+        if !maiConnected {
+            DispatchQueue.main.async { self.maiConnected = true; self.cameraOK = true }
+        }
+
+        // FPS
+        maiFPSCnt += 1
+        let now = Date()
+        if now.timeIntervalSince(maiFPSTs) >= 3 {
+            let fps = Double(maiFPSCnt) / now.timeIntervalSince(maiFPSTs)
+            maiFPSCnt = 0; maiFPSTs = now
+            DispatchQueue.main.async { self.maiFPS = fps }
+        }
+
+        // Enkoduj JPEG → handleExternalFrame (latestJpeg + OCR)
+        maiQ.async { [weak self] in
+            guard let self else { return }
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            guard let cgImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+            guard let jpeg = UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.6) else { return }
+            self.handleExternalFrame(jpeg)
+        }
+    }
+
+    /// Wywoływana przez PiStreamDelegate gdy nowa klatka JPEG z Pi
+    func handlePiFrame(_ jpeg: Data) {
+        // Pi FPS + connected
+        piFPSCnt += 1
+        let now = Date()
+        if now.timeIntervalSince(piFPSTs) >= 3 {
+            let fps = Double(piFPSCnt) / now.timeIntervalSince(piFPSTs)
+            piFPSCnt = 0; piFPSTs = now
+            DispatchQueue.main.async { self.piFPS = fps; self.piConnected = true; self.cameraOK = true }
+        }
+        handleExternalFrame(jpeg)
+    }
+
+    /// Wspólna ścieżka dla Pi i 70mai — latestJpeg + OCR
+    func handleExternalFrame(_ jpeg: Data) {
+        jpegLock.lock()
+        latestJpeg = jpeg
+        jpegLock.unlock()
+
+        guard let uiImage = UIImage(data: jpeg), let cgImage = uiImage.cgImage else { return }
+        let detMode = _detectionModeSafe
+        let ocrMode = _ocrModeSafe
+
+        piQ.async { [weak self] in
+            guard let self else { return }
+
+            switch detMode {
+            case .visionOCR:
+                // ── Obecna logika: OCR na pełnej klatce ──────────────────
+                let req = VNRecognizeTextRequest { [weak self] r, _ in
+                    guard let self else { return }
+                    let observations = r.results as? [VNRecognizedTextObservation] ?? []
+                    let texts = observations.compactMap { o -> (String, Double)? in
+                        guard let t = o.topCandidates(1).first else { return nil }
+                        return (t.string, Double(t.confidence))
+                    }
+                    if ocrMode == .free {
+                        self.processFree(texts)
+                    } else {
+                        self.processPlate(texts)
+                    }
+                }
+                req.recognitionLevel = .fast
+                req.usesLanguageCorrection = false
+                req.recognitionLanguages = ["en-US"]
+                try? VNImageRequestHandler(cgImage: cgImage, orientation: .up).perform([req])
+
+            case .rectangleDetection, .coreMLYOLO:
+                // ── Detekcja regionu → crop → OCR ────────────────────────
+                let handler: ([(String, Double)], [CGRect]) -> Void = { [weak self] texts, boxes in
+                    guard let self else { return }
+                    self.jpegLock.lock()
+                    self.detectedBoxes = boxes
+                    self.jpegLock.unlock()
+                    if ocrMode == .free {
+                        self.processFree(texts)
+                    } else {
+                        self.processPlate(texts)
+                    }
+                }
+
+                if detMode == .rectangleDetection {
+                    self.runRectangleDetection(on: cgImage, orientation: .up, completion: handler)
+                } else {
+                    self.runCoreMLDetection(on: cgImage, orientation: .up, completion: handler)
+                }
+            }
+        }
+    }
 
     private func _startSession(lens: LensType) {
         session.beginConfiguration(); session.inputs.forEach { session.removeInput($0) }
@@ -595,33 +972,60 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             DispatchQueue.main.async { self.ocrFPS = fps }
         }
 
-        let req = VNRecognizeTextRequest { [weak self] r, _ in
-            guard let self else { return }
-            let observations = r.results as? [VNRecognizedTextObservation] ?? []
-            let texts = observations.compactMap { o -> (String, Double)? in
-                guard let t = o.topCandidates(1).first else { return nil }
-                return (t.string, Double(t.confidence))
-            }
-            if self._ocrModeSafe == .free {
-                self.processFree(texts)
-            } else {
-                // Zbierz boxy kandydatów tablic przed głosowaniem
-                let plateObs = observations.filter { o in
-                    guard let t = o.topCandidates(1).first else { return false }
-                    let clean = t.string.uppercased().filter { $0.isLetter || $0.isNumber }
-                    return self.plateRE.firstMatch(in: clean, range: NSRange(clean.startIndex..., in: clean)) != nil
+        let detMode = _detectionModeSafe
+        let ocrMode = _ocrModeSafe
+
+        switch detMode {
+        case .visionOCR:
+            // ── Obecna logika: OCR na pełnej klatce ──────────────────────
+            let req = VNRecognizeTextRequest { [weak self] r, _ in
+                guard let self else { return }
+                let observations = r.results as? [VNRecognizedTextObservation] ?? []
+                let texts = observations.compactMap { o -> (String, Double)? in
+                    guard let t = o.topCandidates(1).first else { return nil }
+                    return (t.string, Double(t.confidence))
                 }
-                let boxes = plateObs.map { $0.boundingBox } // Vision coords: (0,0)=bottomLeft, normalized
+                if ocrMode == .free {
+                    self.processFree(texts)
+                } else {
+                    let plateObs = observations.filter { o in
+                        guard let t = o.topCandidates(1).first else { return false }
+                        let clean = t.string.uppercased().filter { $0.isLetter || $0.isNumber }
+                        return self.plateRE.firstMatch(in: clean, range: NSRange(clean.startIndex..., in: clean)) != nil
+                    }
+                    let boxes = plateObs.map { $0.boundingBox }
+                    self.jpegLock.lock()
+                    self.detectedBoxes = boxes
+                    self.jpegLock.unlock()
+                    self.processPlate(texts)
+                }
+            }
+            req.recognitionLevel = .fast; req.usesLanguageCorrection = false; req.recognitionLanguages = ["en-US"]
+            try? VNImageRequestHandler(cvPixelBuffer: px, orientation: .right).perform([req])
+
+        case .rectangleDetection, .coreMLYOLO:
+            // ── Detekcja regionu → crop → OCR na wycinku ────────────────
+            let ciImage = CIImage(cvPixelBuffer: px)
+            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+
+            let handler: ([(String, Double)], [CGRect]) -> Void = { [weak self] texts, boxes in
+                guard let self else { return }
                 self.jpegLock.lock()
                 self.detectedBoxes = boxes
                 self.jpegLock.unlock()
-                self.processPlate(texts)
+                if ocrMode == .free {
+                    self.processFree(texts)
+                } else {
+                    self.processPlate(texts)
+                }
+            }
+
+            if detMode == .rectangleDetection {
+                runRectangleDetection(on: cgImage, orientation: .right, completion: handler)
+            } else {
+                runCoreMLDetection(on: cgImage, orientation: .right, completion: handler)
             }
         }
-        req.recognitionLevel = .fast; req.usesLanguageCorrection = false; req.recognitionLanguages = ["en-US"]
-        // Bufor z tylnej kamery (portret) = landscape piksele, tekst jest obrócony 90° CW
-        // .right = "obraz jest obrócony 90° CW od naturalnej orientacji" → Vision wyprostowuje przed OCR
-        try? VNImageRequestHandler(cvPixelBuffer: px, orientation: .right).perform([req])
 
         // Zapisz JPEG co ~3 klatki (~10fps dla streamu webowego)
         guard ocrCnt % 3 == 0 else { return }
@@ -789,6 +1193,154 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
 
     private func ts() -> String { DateFormatter().apply { $0.dateFormat = "HH:mm:ss" }.string(from:Date()) }
+
+    // MARK: ─── Detection Modes ────────────────────────────────────────────────
+
+    /// Ładuje model CoreML YOLO z bundle (jeśli dostępny)
+    private func loadYOLOModelIfNeeded() {
+        guard !yoloModelLoaded else { return }
+        yoloModelLoaded = true
+
+        guard let modelURL = Bundle.main.url(forResource: "PlateDetector", withExtension: "mlmodelc")
+                ?? Bundle.main.url(forResource: "PlateDetectorYOLO", withExtension: "mlmodelc") else {
+            print("[GateVision] ⚠️ Brak modelu CoreML w bundle — tryb YOLO niedostępny")
+            return
+        }
+        do {
+            let mlModel = try MLModel(contentsOf: modelURL)
+            yoloModel = try VNCoreMLModel(for: mlModel)
+            DispatchQueue.main.async { self.yoloModelAvailable = true }
+            print("[GateVision] ✅ Model CoreML załadowany: \(modelURL.lastPathComponent)")
+        } catch {
+            print("[GateVision] ❌ Błąd ładowania modelu CoreML: \(error.localizedDescription)")
+            yoloModel = nil
+        }
+    }
+
+    /// OCR na pełnej klatce (fallback i tryb visionOCR)
+    private func runFullFrameOCR(on cgImage: CGImage, orientation: CGImagePropertyOrientation,
+                                  completion: @escaping ([(String, Double)]) -> Void) {
+        let req = VNRecognizeTextRequest { req, _ in
+            let observations = (req.results as? [VNRecognizedTextObservation]) ?? []
+            let texts = observations.compactMap { o -> (String, Double)? in
+                guard let t = o.topCandidates(1).first else { return nil }
+                return (t.string, Double(t.confidence))
+            }
+            completion(texts)
+        }
+        req.recognitionLevel = .fast
+        req.usesLanguageCorrection = false
+        req.recognitionLanguages = ["en-US"]
+        try? VNImageRequestHandler(cgImage: cgImage, orientation: orientation).perform([req])
+    }
+
+    /// VNDetectRectanglesRequest → wycinek → OCR na wycinku
+    private func runRectangleDetection(on cgImage: CGImage, orientation: CGImagePropertyOrientation,
+                                        completion: @escaping ([(String, Double)], [CGRect]) -> Void) {
+        let rectReq = VNDetectRectanglesRequest { [weak self] request, _ in
+            guard let self else { return }
+            let rectangles = (request.results as? [VNRectangleObservation]) ?? []
+
+            // Filtruj do proporcji tablic rejestracyjnych
+            let imgAR = CGFloat(cgImage.width) / CGFloat(cgImage.height)
+            let plateLike = rectangles.filter { obs in
+                let w = obs.boundingBox.width, h = obs.boundingBox.height
+                guard w > 0, h > 0 else { return false }
+                let realRatio = (w / h) * imgAR
+                return realRatio >= 1.5 && realRatio <= 6.0
+            }
+
+            guard !plateLike.isEmpty else { completion([], []); return }
+
+            let boxes = plateLike.map { $0.boundingBox }
+            self.ocrCroppedRegions(cgImage: cgImage, boxes: boxes, completion: completion)
+        }
+
+        rectReq.minimumAspectRatio = 0.15   // shorter/longer — odpowiada ~1:6.7
+        rectReq.maximumAspectRatio = 0.65   // shorter/longer — odpowiada ~1:1.54
+        rectReq.minimumSize = 0.05          // tablica min 5% szerokości obrazu
+        rectReq.maximumObservations = 5
+        rectReq.minimumConfidence = 0.5
+
+        try? VNImageRequestHandler(cgImage: cgImage, orientation: orientation).perform([rectReq])
+    }
+
+    /// CoreML YOLO → wycinek → OCR na wycinku
+    private func runCoreMLDetection(on cgImage: CGImage, orientation: CGImagePropertyOrientation,
+                                     completion: @escaping ([(String, Double)], [CGRect]) -> Void) {
+        guard let model = yoloModel else {
+            // Fallback: brak modelu → pełna klatka OCR
+            runFullFrameOCR(on: cgImage, orientation: orientation) { texts in
+                completion(texts, [])
+            }
+            return
+        }
+
+        let coreMLReq = VNCoreMLRequest(model: model) { [weak self] request, _ in
+            guard let self else { return }
+            let detections = (request.results as? [VNRecognizedObjectObservation]) ?? []
+
+            guard !detections.isEmpty else { completion([], []); return }
+
+            let boxes = detections.map { $0.boundingBox }
+            self.ocrCroppedRegions(cgImage: cgImage, boxes: boxes, completion: completion)
+        }
+        coreMLReq.imageCropAndScaleOption = .scaleFill
+
+        try? VNImageRequestHandler(cgImage: cgImage, orientation: orientation).perform([coreMLReq])
+    }
+
+    /// Wspólna metoda: wycina regiony z CGImage i puszcza OCR na każdym wycinku
+    private func ocrCroppedRegions(cgImage: CGImage, boxes: [CGRect],
+                                    completion: @escaping ([(String, Double)], [CGRect]) -> Void) {
+        let imgW = CGFloat(cgImage.width)
+        let imgH = CGFloat(cgImage.height)
+        let textsLock = NSLock()
+        var allTexts: [(String, Double)] = []
+        let group = DispatchGroup()
+
+        for box in boxes {
+            group.enter()
+            // Vision: origin bottomLeft, normalized → CGImage: origin topLeft
+            let cropRect = CGRect(
+                x: box.origin.x * imgW,
+                y: (1 - box.origin.y - box.height) * imgH,
+                width: box.width * imgW,
+                height: box.height * imgH
+            ).integral
+
+            // Padding 10% dla lepszego OCR
+            let padX = cropRect.width * 0.1, padY = cropRect.height * 0.1
+            let paddedRect = cropRect.insetBy(dx: -padX, dy: -padY)
+                .intersection(CGRect(x: 0, y: 0, width: imgW, height: imgH))
+
+            guard paddedRect.width > 0, paddedRect.height > 0,
+                  let croppedCG = cgImage.cropping(to: paddedRect) else {
+                group.leave()
+                continue
+            }
+
+            let ocrReq = VNRecognizeTextRequest { req, _ in
+                let observations = (req.results as? [VNRecognizedTextObservation]) ?? []
+                let texts = observations.compactMap { o -> (String, Double)? in
+                    guard let t = o.topCandidates(1).first else { return nil }
+                    return (t.string, Double(t.confidence))
+                }
+                textsLock.lock()
+                allTexts.append(contentsOf: texts)
+                textsLock.unlock()
+                group.leave()
+            }
+            ocrReq.recognitionLevel = .fast
+            ocrReq.usesLanguageCorrection = false
+            ocrReq.recognitionLanguages = ["en-US"]
+            try? VNImageRequestHandler(cgImage: croppedCG, orientation: .up).perform([ocrReq])
+        }
+
+        group.notify(queue: ocrQ) {
+            completion(allTexts, boxes)
+        }
+    }
 }
 
 extension DateFormatter {
@@ -1070,18 +1622,19 @@ struct RootView: View {
                 minTimeDone = true
                 checkDismiss()
             }
+            // Fallback: dismiss splash after splash min + 8s regardless of state
+            DispatchQueue.main.asyncAfter(deadline: .now() + engine.splashMinDuration + 8.0) {
+                if !splashDone {
+                    withAnimation(.easeInOut(duration: 0.5)) { splashDone = true }
+                }
+            }
         }
-        .onChange(of: splashIsDone) { _, newValue in
-            if newValue { checkDismiss() }
-        }
-    }
-
-    private var splashIsDone: Bool {
-        engine.cameraOK && webServer.isRunning
+        .onChange(of: engine.cameraOK) { _, _ in checkDismiss() }
+        .onChange(of: webServer.isRunning) { _, _ in checkDismiss() }
     }
 
     private func checkDismiss() {
-        guard splashIsDone && minTimeDone else { return }
+        guard engine.cameraOK, webServer.isRunning, minTimeDone else { return }
         withAnimation(.easeInOut(duration: 0.5)) { splashDone = true }
     }
 
@@ -1184,17 +1737,62 @@ struct StatusTab: View {
             ScrollView {
                 VStack(spacing:18) {
 
-                    // Camera
+                    // Camera — iPhone lub Raspberry Pi
                     ZStack(alignment:.topLeading) {
                         Group {
                             if showCam {
-                                CameraPreviewView(session:engine.captureSession).frame(height:230).clipped()
-                                    .overlay(LinearGradient(colors:[.clear,GV.bgBottom.opacity(0.85)],startPoint:.center,endPoint:.bottom))
+                                if engine.cameraSource == .iphone {
+                                    CameraPreviewView(session:engine.captureSession).frame(height:230).clipped()
+                                        .overlay(LinearGradient(colors:[.clear,GV.bgBottom.opacity(0.85)],startPoint:.center,endPoint:.bottom))
+                                } else {
+                                    // Pi / 70mai live frame
+                                    ZStack {
+                                        Rectangle().fill(Color.black).frame(height:230)
+                                        if let jpeg = engine.latestJpeg, let ui = UIImage(data: jpeg) {
+                                            Image(uiImage: ui).resizable().scaledToFill().frame(height:230).clipped()
+                                                .overlay(LinearGradient(colors:[.clear,GV.bgBottom.opacity(0.7)],startPoint:.center,endPoint:.bottom))
+                                        } else {
+                                            let isConn  = engine.cameraSource == .raspberryPi ? engine.piConnected : engine.maiConnected
+                                            let addrLbl = engine.cameraSource == .raspberryPi ? engine.piAddress : engine.maiRtspURL
+                                            let connTxt = engine.cameraSource == .seventyMai
+                                                ? (engine.maiConnected ? "Łączenie..." : "Brak połączenia z 70mai")
+                                                : (engine.piConnected  ? "Łączenie..." : "Brak połączenia z Pi")
+                                            VStack(spacing:10) {
+                                                Image(systemName: isConn ? "wifi" : "wifi.slash")
+                                                    .font(.system(size:32)).foregroundStyle(isConn ? GV.lime : GV.red)
+                                                Text(connTxt).font(.system(size:13)).foregroundStyle(GV.muted)
+                                                Text(addrLbl).font(.system(size:11,design:.monospaced)).foregroundStyle(GV.muted.opacity(0.5))
+                                            }
+                                        }
+                                    }.frame(height:230)
+                                }
                             } else { Rectangle().fill(.ultraThinMaterial).frame(height:52) }
                         }.animation(.easeInOut(duration:0.3),value:showCam)
 
                         VStack {
                             HStack {
+                                // Źródło — badge
+                                if engine.cameraSource == .raspberryPi {
+                                    HStack(spacing:4) {
+                                        Circle().fill(engine.piConnected ? GV.lime : GV.red).frame(width:6,height:6)
+                                        Text(engine.piConnected ? "Pi \(String(format:"%.0f",engine.piFPS))fps" : "Pi offline")
+                                            .font(.system(size:10,weight:.bold))
+                                            .foregroundStyle(engine.piConnected ? GV.lime : GV.red)
+                                    }
+                                    .padding(.horizontal,8).padding(.vertical,4)
+                                    .background(.black.opacity(0.5)).clipShape(Capsule())
+                                    .padding(10)
+                                } else if engine.cameraSource == .seventyMai {
+                                    HStack(spacing:4) {
+                                        Circle().fill(engine.maiConnected ? GV.orange : GV.red).frame(width:6,height:6)
+                                        Text(engine.maiConnected ? "70mai \(String(format:"%.0f",engine.maiFPS))fps" : "70mai offline")
+                                            .font(.system(size:10,weight:.bold))
+                                            .foregroundStyle(engine.maiConnected ? GV.orange : GV.red)
+                                    }
+                                    .padding(.horizontal,8).padding(.vertical,4)
+                                    .background(.black.opacity(0.5)).clipShape(Capsule())
+                                    .padding(10)
+                                }
                                 Spacer()
                                 Button { withAnimation { showCam.toggle() } } label: {
                                     Image(systemName: showCam ? "eye.slash" : "eye")
@@ -1263,8 +1861,8 @@ struct GateCard: View {
                 Spacer()
             }
             HStack(spacing:12) {
-                GlassBtn(label:"Otwórz",icon:"door.open.fill",color:GV.lime) { engine.triggerOpen() }
-                GlassBtn(label:"Zamknij",icon:"door.closed.fill",color:GV.red) { engine.triggerClose() }
+                GlassBtn(label:"Otwórz",icon:"door.left.hand.open",color:GV.lime) { engine.triggerOpen() }
+                GlassBtn(label:"Zamknij",icon:"door.left.hand.closed",color:GV.red) { engine.triggerClose() }
             }
         }
         .padding(18)
@@ -1570,20 +2168,112 @@ struct SettingsTab: View {
                         }.padding(.vertical,6)
                     } header: { Text("Panel Web — port 6600") }
 
+                    // ── Źródło kamery ────────────────────────────────────
+                    Section {
+                        Picker("Źródło", selection: $engine.cameraSource) {
+                            ForEach(CameraSource.allCases) { Text($0.label).tag($0) }
+                        }.pickerStyle(.segmented)
+
+                        // ── Raspberry Pi ──────────────────────────────────────
+                        if engine.cameraSource == .raspberryPi {
+                            HStack {
+                                Image(systemName: "network").foregroundStyle(GV.azure)
+                                TextField("Adres IP Pi (np. 192.168.1.100)", text: $engine.piAddress)
+                                    .keyboardType(.decimalPad)
+                                    .autocorrectionDisabled()
+                                    .font(.system(size: 14, design: .monospaced))
+                            }
+                            Button {
+                                engine.startPiStream()
+                            } label: {
+                                HStack {
+                                    Circle()
+                                        .fill(engine.piConnected ? GV.green : GV.red)
+                                        .frame(width: 8, height: 8)
+                                    Text(engine.piConnected
+                                         ? "Połączono z Pi — FPS: \(String(format:"%.1f", engine.piFPS))"
+                                         : "Rozłączono — Dotknij by połączyć")
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(engine.piConnected ? GV.green : GV.orange)
+                                }
+                            }
+                            Text("MJPEG: http://\(engine.piAddress):6600/api/stream")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(GV.muted)
+                        }
+
+                        // ── 70mai ─────────────────────────────────────────────
+                        if engine.cameraSource == .seventyMai {
+                            HStack {
+                                Image(systemName: "car.fill").foregroundStyle(GV.orange)
+                                TextField("RTSP URL", text: $engine.maiRtspURL)
+                                    .keyboardType(.URL)
+                                    .autocorrectionDisabled()
+                                    .autocapitalization(.none)
+                                    .font(.system(size: 13, design: .monospaced))
+                            }
+                            Button {
+                                engine.startMaiStream()
+                            } label: {
+                                HStack {
+                                    Circle()
+                                        .fill(engine.maiConnected ? GV.green : GV.red)
+                                        .frame(width: 8, height: 8)
+                                    Text(engine.maiConnected
+                                         ? "70mai połączono — FPS: \(String(format:"%.1f", engine.maiFPS))"
+                                         : "Rozłączono — Dotknij by połączyć")
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(engine.maiConnected ? GV.green : GV.orange)
+                                }
+                            }
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("📡 Podłącz iPhone do sieci WiFi 70mai (70mai_A500S_XXXX)")
+                                Text("🔗 Domyślny URL: rtsp://192.168.0.1:554")
+                            }
+                            .font(.system(size: 11))
+                            .foregroundStyle(GV.muted)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+
+                    } header: { Text("Źródło kamery") }
+                    .listRowBackground(Color.white.opacity(0.04))
+
                     // ── OCR ──────────────────────────────────────────────
                     Section {
                         Picker("Tryb",selection:$engine.ocrMode) { ForEach(OCRMode.allCases) { Text($0.label).tag($0) } }.pickerStyle(.segmented)
                         Text(engine.ocrMode.description).font(.system(size:12)).foregroundStyle(engine.ocrMode == .plate ? GV.muted:GV.azure)
                     } header: { Text("Tryb OCR") }
 
-                    // ── Obiektyw ─────────────────────────────────────────
+                    // ── Tryb detekcji tablic ─────────────────────────────
                     Section {
-                        if engine.availableLenses.count > 1 {
-                            Picker("Obiektyw",selection:$engine.selectedLens) { ForEach(engine.availableLenses) { Text($0.label).tag($0) } }.pickerStyle(.segmented)
-                        } else {
-                            Text("Jeden obiektyw dostępny.").font(.system(size:12)).foregroundStyle(GV.muted)
+                        Picker("Detekcja", selection: $engine.detectionMode) {
+                            ForEach(DetectionMode.allCases) { Text($0.label).tag($0) }
+                        }.pickerStyle(.segmented)
+                        Text(engine.detectionMode.description)
+                            .font(.system(size: 12))
+                            .foregroundStyle(engine.detectionMode == .visionOCR ? GV.muted : GV.azure)
+                        if engine.detectionMode == .coreMLYOLO && !engine.yoloModelAvailable {
+                            HStack(spacing: 6) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(GV.orange)
+                                Text("Brak modelu CoreML — fallback do pełnej klatki")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(GV.orange)
+                            }
                         }
-                    } header: { Text("Obiektyw") }
+                    } header: { Text("Tryb detekcji tablic") }
+                    .listRowBackground(Color.white.opacity(0.04))
+
+                    // ── Obiektyw — tylko dla iPhone kamery ───────────────
+                    if engine.cameraSource == .iphone {
+                        Section {
+                            if engine.availableLenses.count > 1 {
+                                Picker("Obiektyw",selection:$engine.selectedLens) { ForEach(engine.availableLenses) { Text($0.label).tag($0) } }.pickerStyle(.segmented)
+                            } else {
+                                Text("Jeden obiektyw dostępny.").font(.system(size:12)).foregroundStyle(GV.muted)
+                            }
+                        } header: { Text("Obiektyw") }
+                    }
 
                     // ── Głosowanie ───────────────────────────────────────
                     Section("Głosowanie") {
@@ -1600,9 +2290,11 @@ struct SettingsTab: View {
 
                     // ── Info ─────────────────────────────────────────────
                     Section("Info") {
-                        LabeledContent("Silnik OCR",value:"Apple Vision")
+                        LabeledContent("Silnik OCR",value:"Vision + \(engine.detectionMode.label)")
                         LabeledContent("OCR FPS",value:String(format:"%.1f fps",engine.ocrFPS))
-                        LabeledContent("Kamera",value:engine.cameraOK ? "Połączona":"Brak")
+                        LabeledContent("Kamera", value: engine.cameraSource == .iphone
+                            ? (engine.cameraOK ? "iPhone ✓" : "iPhone — brak")
+                            : (engine.piConnected ? "Pi ✓ (\(String(format:"%.1f",engine.piFPS)) fps)" : "Pi — brak połączenia"))
                         LabeledContent("Brama",value:engine.gateState.rawValue)
                         LabeledContent("Adres web",value:webServer.isRunning ? "http://\(webServer.localIP):6600":"—")
                     }
@@ -1670,7 +2362,18 @@ struct DebugTab: View {
                 // ── Kamera ───────────────────────────────────────────────
                 Section {
                     LabeledContent("Status",value:engine.cameraOK ? "✓ Aktywna" : "✗ Brak")
-                    LabeledContent("Obiektyw",value:engine.selectedLens.label)
+                    LabeledContent("Źródło",value:engine.cameraSource.label)
+                    if engine.cameraSource == .raspberryPi {
+                        LabeledContent("Pi adres",value:engine.piAddress)
+                        LabeledContent("Pi status",value:engine.piConnected ? "Połączono" : "Brak")
+                        LabeledContent("Pi FPS",value:String(format:"%.1f fps",engine.piFPS))
+                    } else if engine.cameraSource == .seventyMai {
+                        LabeledContent("70mai URL",value:engine.maiRtspURL)
+                        LabeledContent("70mai status",value:engine.maiConnected ? "Połączono" : "Brak")
+                        LabeledContent("70mai FPS",value:String(format:"%.1f fps",engine.maiFPS))
+                    } else {
+                        LabeledContent("Obiektyw",value:engine.selectedLens.label)
+                    }
                     LabeledContent("Dostępne obiektywy",value:engine.availableLenses.map{$0.label}.joined(separator:", "))
                     LabeledContent("Snapshot bufor",value:engine.latestJpeg != nil ? "\(engine.latestJpeg!.count / 1024) KB" : "—")
                 } header: { Text("Kamera") }
@@ -1690,13 +2393,13 @@ struct DebugTab: View {
                     Button {
                         engine.triggerOpen()
                     } label: {
-                        Label("Test: otwórz bramę", systemImage:"door.open.fill")
+                        Label("Test: otwórz bramę", systemImage:"door.left.hand.open")
                             .foregroundStyle(GV.lime)
                     }
                     Button {
                         engine.triggerClose()
                     } label: {
-                        Label("Test: zamknij bramę", systemImage:"door.closed.fill")
+                        Label("Test: zamknij bramę", systemImage:"door.left.hand.closed")
                             .foregroundStyle(GV.orange)
                     }
                 } header: { Text("Testy") }
