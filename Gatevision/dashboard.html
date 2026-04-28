@@ -129,6 +129,7 @@ input[type=number]{background:rgba(255,255,255,.06);border:1px solid var(--borde
     <button class="tab-btn" onclick="tab('log')" id="tab-btn-log"><i class="fa-solid fa-list"></i> Logi</button>
     <button class="tab-btn" onclick="tab('plates')" id="tab-btn-plates"><i class="fa-solid fa-car"></i> Tablice</button>
     <button class="tab-btn" onclick="tab('settings')" id="tab-btn-settings"><i class="fa-solid fa-gear"></i> Ustawienia</button>
+    <button class="tab-btn" onclick="tab('debug')" id="tab-btn-debug"><i class="fa-solid fa-bug"></i> Debug</button>
   </div>
   <div id="content">
     <div class="tab-panel active" id="tab-live">
@@ -184,11 +185,71 @@ input[type=number]{background:rgba(255,255,255,.06);border:1px solid var(--borde
     <div class="tab-panel" id="tab-settings">
       <div class="s-content">
         <div class="s-group"><div class="s-group-title">Tryb OCR</div><div class="s-row"><span class="s-label">Aktywny tryb</span><div class="ocr-toggle"><button class="ocr-opt" id="ocr-plate" onclick="setMode('plate')">🔍 Tablica</button><button class="ocr-opt" id="ocr-free" onclick="setMode('free')">📋 Wolny</button></div></div></div>
+        <div class="s-group"><div class="s-group-title">Tryb detekcji</div>
+          <div class="s-row"><span class="s-label">Aktywna detekcja</span><div class="ocr-toggle" id="det-btns"></div></div>
+          <div class="s-row" id="det-desc-row" style="border-bottom:none"><span class="s-label" id="det-desc" style="font-size:12px;color:var(--muted)"></span></div>
+          <div class="s-row" id="yolo-warn" style="display:none;border-bottom:none"><span style="font-size:11px;color:var(--orange)"><i class="fa-solid fa-triangle-exclamation"></i> Brak modelu CoreML — fallback do pełnej klatki</span></div>
+        </div>
+        <div class="s-group"><div class="s-group-title">Źródło kamery</div>
+          <div class="s-row"><span class="s-label">Aktywne źródło</span><div class="ocr-toggle" id="src-btns"></div></div>
+          <div id="pi-fields" style="display:none">
+            <div class="s-row"><span class="s-label">Adres IP Raspberry Pi</span><input type="text" class="fi" id="s-pi-addr" placeholder="192.168.1.100" style="width:180px;background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:6px;color:var(--fg);padding:5px 10px;font-size:13px;font-family:'DM Mono',monospace"></div>
+          </div>
+          <div id="mai-fields" style="display:none">
+            <div class="s-row"><span class="s-label">RTSP URL (70mai)</span><input type="text" class="fi" id="s-mai-url" placeholder="rtsp://192.168.0.1:554" style="width:240px;background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:6px;color:var(--fg);padding:5px 10px;font-size:13px;font-family:'DM Mono',monospace"></div>
+          </div>
+        </div>
+        <div class="s-group" id="sg-res" style="display:none"><div class="s-group-title">Rozdzielczość kamery</div>
+          <div class="s-row"><span class="s-label">Aktywna rozdzielczość</span><div class="ocr-toggle" id="res-btns"></div></div>
+          <div class="s-row" style="border-bottom:none"><span class="s-label" id="res-desc" style="font-size:12px;color:var(--muted)"></span></div>
+        </div>
         <div class="s-group" id="sg-lens" style="display:none"><div class="s-group-title">Obiektyw kamery</div><div class="s-row"><span class="s-label">Aktywny obiektyw</span><div class="ocr-toggle" id="lens-btns"></div></div></div>
         <div class="s-group"><div class="s-group-title">Czasy bramy</div><div class="s-row"><span class="s-label">Otwieranie (s)</span><input type="number" id="s1" min="1" max="30"></div><div class="s-row"><span class="s-label">Czas otwarcia (s)</span><input type="number" id="s2" min="1" max="120"></div><div class="s-row"><span class="s-label">Zamykanie (s)</span><input type="number" id="s3" min="1" max="30"></div></div>
         <div class="s-group"><div class="s-group-title">Głosowanie</div><div class="s-row"><span class="s-label">Min. powtórzeń</span><input type="number" id="s4" min="1" max="10"></div><div class="s-row"><span class="s-label">Okno (klatki)</span><input type="number" id="s5" min="2" max="20"></div></div>
         <button class="btn btn-p" onclick="saveSettings()"><i class="fa-solid fa-floppy-disk"></i> Zapisz</button>
         <div id="sm" style="font-size:13px;color:var(--lime);display:none">✓ Zapisano</div>
+      </div>
+    </div>
+    <div class="tab-panel" id="tab-debug" style="flex-direction:column">
+      <div style="flex:1;overflow-y:auto;padding:22px;max-width:900px">
+        <div class="s-group" style="margin-bottom:14px"><div class="s-group-title"><i class="fa-solid fa-circle-info" style="color:var(--purple)"></i> Aplikacja</div>
+          <div class="s-row"><span class="s-label">Wersja</span><span id="dbg-version" style="font-family:'DM Mono',monospace;color:var(--azure)">—</span></div>
+          <div class="s-row"><span class="s-label">Build</span><span id="dbg-build" style="font-family:'DM Mono',monospace;color:var(--azure)">—</span></div>
+          <div class="s-row"><span class="s-label">Web Server</span><span id="dbg-ws" style="font-family:'DM Mono',monospace;color:var(--lime)">—</span></div>
+          <div class="s-row"><span class="s-label">GitHub</span><a id="dbg-gh" href="https://github.com/mrfroncu/Gatevision-iOS" target="_blank" style="font-family:'DM Mono',monospace;font-size:12px;color:var(--azure);text-decoration:none">mrfroncu/Gatevision-iOS <i class="fa-solid fa-arrow-up-right-from-square" style="font-size:10px"></i></a></div>
+        </div>
+        <div class="s-group" style="margin-bottom:14px"><div class="s-group-title"><i class="fa-solid fa-gauge-high" style="color:var(--lime)"></i> Diagnostyka OCR</div>
+          <div class="s-row"><span class="s-label">OCR FPS</span><span id="dbg-fps" style="font-family:'DM Mono',monospace;color:var(--lime)">—</span></div>
+          <div class="s-row"><span class="s-label">Silnik</span><span id="dbg-engine" style="font-family:'DM Mono',monospace;color:var(--muted)">—</span></div>
+          <div class="s-row"><span class="s-label">Język OCR</span><span id="dbg-lang" style="font-family:'DM Mono',monospace;color:var(--muted)">—</span></div>
+          <div class="s-row"><span class="s-label">Tryb detekcji</span><span id="dbg-det" style="font-family:'DM Mono',monospace;color:var(--azure)">—</span></div>
+          <div class="s-row"><span class="s-label">YOLO Model</span><span id="dbg-yolo" style="font-family:'DM Mono',monospace">—</span></div>
+          <div class="s-row"><span class="s-label">Wykryte boxy</span><span id="dbg-boxes" style="font-family:'DM Mono',monospace;color:var(--purple)">—</span></div>
+          <div class="s-row"><span class="s-label">Rozdzielczość</span><span id="dbg-res" style="font-family:'DM Mono',monospace;color:var(--muted)">—</span></div>
+        </div>
+        <div class="s-group" style="margin-bottom:14px"><div class="s-group-title"><i class="fa-solid fa-camera" style="color:var(--azure)"></i> Kamera</div>
+          <div class="s-row"><span class="s-label">Status</span><span id="dbg-cam" style="font-family:'DM Mono',monospace">—</span></div>
+          <div class="s-row"><span class="s-label">Źródło</span><span id="dbg-src" style="font-family:'DM Mono',monospace;color:var(--azure)">—</span></div>
+          <div class="s-row" id="dbg-pi-row" style="display:none"><span class="s-label">Pi status</span><span id="dbg-pi" style="font-family:'DM Mono',monospace">—</span></div>
+          <div class="s-row" id="dbg-mai-row" style="display:none"><span class="s-label">70mai status</span><span id="dbg-mai" style="font-family:'DM Mono',monospace">—</span></div>
+          <div class="s-row"><span class="s-label">Obiektyw</span><span id="dbg-lens" style="font-family:'DM Mono',monospace;color:var(--muted)">—</span></div>
+          <div class="s-row"><span class="s-label">Snapshot bufor</span><span id="dbg-snap" style="font-family:'DM Mono',monospace;color:var(--muted)">—</span></div>
+        </div>
+        <div class="s-group" style="margin-bottom:14px"><div class="s-group-title"><i class="fa-solid fa-database" style="color:var(--orange)"></i> Baza danych</div>
+          <div class="s-row"><span class="s-label">Tablic w bazie</span><span id="dbg-plates" style="font-family:'DM Mono',monospace;color:var(--purple)">—</span></div>
+          <div class="s-row"><span class="s-label">Wpisów w logach</span><span id="dbg-logs" style="font-family:'DM Mono',monospace;color:var(--purple)">—</span></div>
+        </div>
+        <div class="s-group" style="margin-bottom:14px"><div class="s-group-title"><i class="fa-solid fa-brain" style="color:var(--purple)"></i> Logi YOLO ML</div>
+          <div class="s-row" style="justify-content:flex-start;gap:10px">
+            <button class="btn btn-sm" id="ml-toggle-btn" onclick="toggleML()" style="background:rgba(184,255,53,.1);border:1px solid rgba(184,255,53,.3);color:var(--lime)"><i class="fa-solid fa-play"></i> Włącz</button>
+            <button class="btn btn-r btn-sm" onclick="clearML()"><i class="fa-solid fa-trash"></i> Wyczyść</button>
+            <button class="btn btn-o btn-sm" onclick="copyML()" id="ml-copy-btn"><i class="fa-solid fa-copy"></i> Kopiuj</button>
+            <span id="ml-count" style="font-size:11px;font-family:'DM Mono',monospace;color:var(--muted);margin-left:auto">0 wpisów</span>
+          </div>
+        </div>
+        <div id="ml-log-wrap" style="background:var(--bg);border:1px solid var(--border);border-radius:10px;max-height:400px;overflow-y:auto;padding:10px;font-family:'DM Mono',monospace;font-size:10px;line-height:1.6;margin-bottom:20px">
+          <div id="ml-log-content" style="color:var(--muted)">Brak logów ML</div>
+        </div>
       </div>
     </div>
   </div>
@@ -208,7 +269,8 @@ let _eid=null,_seen=new Set(),_det=0,_start=Date.now();
 setInterval(()=>{const s=Math.floor((Date.now()-_start)/1000);const el=document.getElementById('du');if(el)el.textContent=[Math.floor(s/3600),Math.floor((s%3600)/60),s%60].map(n=>String(n).padStart(2,'0')).join(':');},1000);
 async function api(m,u,b){const o={method:m,headers:{'Content-Type':'application/json'}};if(b)o.body=JSON.stringify(b);const r=await fetch(u,o);return r.json();}
 function deb(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
-function tab(n){document.querySelectorAll('.tab-panel,.tab-btn').forEach(e=>e.classList.remove('active'));document.getElementById('tab-'+n).classList.add('active');document.getElementById('tab-btn-'+n).classList.add('active');if(n==='log')loadLog();if(n==='plates')loadPlates();if(n==='settings')loadSettings();}
+let _debugInterval=null;
+function tab(n){document.querySelectorAll('.tab-panel,.tab-btn').forEach(e=>e.classList.remove('active'));document.getElementById('tab-'+n).classList.add('active');document.getElementById('tab-btn-'+n).classList.add('active');if(n==='log')loadLog();if(n==='plates')loadPlates();if(n==='settings')loadSettings();if(n==='debug')loadDebug();if(_debugInterval){clearInterval(_debugInterval);_debugInterval=null;}if(n==='debug')_debugInterval=setInterval(loadDebug,3000);}
 const SM={
   'OTWARTA':{cls:'open',icon:'fa-door-open',lbl:'BRAMA OTWARTA',pill:'pill-lime',dot:'pulse'},
   'OTWIERANIE':{cls:'opening',icon:'fa-spinner fa-spin',lbl:'BRAMA OTWIERANIE',pill:'pill-azure',dot:'pulse'},
@@ -235,7 +297,9 @@ async function pollStatus(){
   document.getElementById('dc').style.color=ok?'var(--lime)':'var(--red)';
   const lensLabels={ultrawide:'0.5×',wide:'1×',telephoto:'2×'};
   const lensLabel=lensLabels[s.selected_lens]||s.selected_lens||'';
-  document.getElementById('dm').textContent='Tryb: '+(s.ocr_mode==='plate'?'Tablica':'Wolny')+(lensLabel?' · '+lensLabel:'');
+  const srcLabels={iphone:'iPhone',raspberryPi:'Pi',seventyMai:'70mai'};
+  const srcLabel=srcLabels[s.camera_source]||'';
+  document.getElementById('dm').textContent='Tryb: '+(s.ocr_mode==='plate'?'Tablica':'Wolny')+(lensLabel?' · '+lensLabel:'')+(srcLabel?' · '+srcLabel:'');
   }catch(e){}
 }
 setInterval(pollStatus,900);pollStatus();
@@ -305,15 +369,36 @@ async function loadSettings(){
   document.getElementById('s4').value=s.min_votes||2;
   document.getElementById('s5').value=s.vote_window||6;
   setModeUI(s.ocr_mode||'plate');
+  // Tryb detekcji
+  const detModes=[{v:'visionOCR',l:'Pełna klatka'},{v:'rectangleDetection',l:'Prostokąty'},{v:'coreMLYOLO',l:'YOLO ML'},{v:'coreMLDirect',l:'CoreML'}];
+  const detSel=s.detection_mode||'visionOCR';
+  const detDescs={visionOCR:'OCR na pełnej klatce — obecne zachowanie.',rectangleDetection:'Wykrywa prostokąty tablic, potem OCR na wycinku.',coreMLYOLO:'Model CoreML YOLO do detekcji tablic, potem OCR.',coreMLDirect:'CoreML bezpośrednio — pełna kontrola nad preprocessingiem.'};
+  document.getElementById('det-btns').innerHTML=detModes.map(d=>`<button class="ocr-opt${d.v===detSel?' ap':''}" onclick="setDetMode('${d.v}')">${d.l}</button>`).join('');
+  document.getElementById('det-desc').textContent=detDescs[detSel]||'';
+  const yw=document.getElementById('yolo-warn');if(yw)yw.style.display=((detSel==='coreMLYOLO'||detSel==='coreMLDirect')&&!s.yolo_model_loaded)?'':'none';
+  // Źródło kamery
+  const sources=[{v:'iphone',l:'📱 iPhone'},{v:'raspberryPi',l:'🎥 Pi'},{v:'seventyMai',l:'🚗 70mai'}];
+  const srcSel=s.camera_source||'iphone';
+  document.getElementById('src-btns').innerHTML=sources.map(src=>`<button class="ocr-opt${src.v===srcSel?' ap':''}" onclick="setCamSource('${src.v}')">${src.l}</button>`).join('');
+  document.getElementById('pi-fields').style.display=srcSel==='raspberryPi'?'':'none';
+  document.getElementById('mai-fields').style.display=srcSel==='seventyMai'?'':'none';
+  document.getElementById('s-pi-addr').value=s.pi_address||'192.168.1.100';
+  document.getElementById('s-mai-url').value=s.mai_rtsp_url||'rtsp://192.168.0.1:554';
+  // Rozdzielczość (tylko iPhone)
+  const sgRes=document.getElementById('sg-res');
+  const resolutions=[{v:'hd720p',l:'720p'},{v:'hd1080p',l:'1080p'},{v:'uhd4K',l:'4K'}];
+  const resSel=s.camera_resolution||'hd720p';
+  const resDescs={hd720p:'Niska latencja, mniejsze zużycie baterii.',hd1080p:'Balans jakości i wydajności.',uhd4K:'Maks. zasięg detekcji — większe zużycie CPU/baterii.'};
+  if(srcSel==='iphone'){sgRes.style.display='';document.getElementById('res-btns').innerHTML=resolutions.map(r=>`<button class="ocr-opt${r.v===resSel?' ap':''}" onclick="setResolution('${r.v}')">${r.l}</button>`).join('');document.getElementById('res-desc').textContent=resDescs[resSel]||'';}else{sgRes.style.display='none';}
   // Obiektyw
   const avail=s.available_lenses||['wide'];
   const sel=s.selected_lens||'wide';
-  const lensLabels={ultrawide:'0.5×',wide:'1×',telephoto:'2×'};
+  const llabels={ultrawide:'0.5×',wide:'1×',telephoto:'2×'};
   const sg=document.getElementById('sg-lens');
   const btns=document.getElementById('lens-btns');
-  if(avail.length>1){
+  if(avail.length>1&&srcSel==='iphone'){
     sg.style.display='';
-    btns.innerHTML=avail.map(l=>`<button class="ocr-opt${l===sel?' ap':''}" id="lens-${l}" onclick="setLens('${l}')">${lensLabels[l]||l}</button>`).join('');
+    btns.innerHTML=avail.map(l=>`<button class="ocr-opt${l===sel?' ap':''}" id="lens-${l}" onclick="setLens('${l}')">${llabels[l]||l}</button>`).join('');
   } else { sg.style.display='none'; }
 }
 function setLens(l){
@@ -323,7 +408,60 @@ function setLens(l){
 }
 function setModeUI(m){document.getElementById('ocr-plate').className='ocr-opt'+(m==='plate'?' ap':'');document.getElementById('ocr-free').className='ocr-opt'+(m==='free'?' af':'');}
 async function setMode(m){setModeUI(m);await api('POST','/api/settings',{ocr_mode:m});}
-async function saveSettings(){await api('POST','/api/settings',{gate_opening_time:+document.getElementById('s1').value,gate_open_duration:+document.getElementById('s2').value,gate_closing_time:+document.getElementById('s3').value,min_votes:+document.getElementById('s4').value,vote_window:+document.getElementById('s5').value});const e=document.getElementById('sm');e.style.display='block';setTimeout(()=>e.style.display='none',2000);}
+function setDetMode(m){api('POST','/api/settings',{detection_mode:m}).then(()=>loadSettings());}
+function setCamSource(src){
+  if(!confirm('Zmiana źródła kamery zrestartuje pipeline. Kontynuować?'))return;
+  const body={camera_source:src};
+  const pa=document.getElementById('s-pi-addr').value;
+  const mu=document.getElementById('s-mai-url').value;
+  if(src==='raspberryPi'&&pa)body.pi_address=pa;
+  if(src==='seventyMai'&&mu)body.mai_rtsp_url=mu;
+  api('POST','/api/settings',body).then(()=>loadSettings());
+}
+function setResolution(r){api('POST','/api/settings',{camera_resolution:r}).then(()=>loadSettings());}
+async function saveSettings(){
+  const body={gate_opening_time:+document.getElementById('s1').value,gate_open_duration:+document.getElementById('s2').value,gate_closing_time:+document.getElementById('s3').value,min_votes:+document.getElementById('s4').value,vote_window:+document.getElementById('s5').value};
+  const pa=document.getElementById('s-pi-addr');if(pa&&pa.value)body.pi_address=pa.value;
+  const mu=document.getElementById('s-mai-url');if(mu&&mu.value)body.mai_rtsp_url=mu.value;
+  await api('POST','/api/settings',body);const e=document.getElementById('sm');e.style.display='block';setTimeout(()=>e.style.display='none',2000);
+}
+// ── Debug tab ────────────────────────────────────────────────────────────────
+async function loadDebug(){
+  try{const d=await api('GET','/api/debug');
+  document.getElementById('dbg-version').textContent=d.app_version||'—';
+  document.getElementById('dbg-build').textContent=d.app_build||'—';
+  const wsEl=document.getElementById('dbg-ws');wsEl.textContent=d.web_server_running?'http://'+d.web_server_ip+':'+d.web_server_port:'Wyłączony';wsEl.style.color=d.web_server_running?'var(--lime)':'var(--red)';
+  document.getElementById('dbg-fps').textContent=(d.ocr_fps||0).toFixed(2)+' fps';
+  document.getElementById('dbg-engine').textContent=d.ocr_engine||'—';
+  document.getElementById('dbg-lang').textContent=d.ocr_language||'—';
+  document.getElementById('dbg-det').textContent=d.detection_mode_label||'—';
+  const yEl=document.getElementById('dbg-yolo');yEl.textContent=d.yolo_model_loaded?'Załadowany':'Niedostępny';yEl.style.color=d.yolo_model_loaded?'var(--lime)':'var(--red)';
+  document.getElementById('dbg-boxes').textContent=d.detected_boxes||0;
+  document.getElementById('dbg-res').textContent=d.camera_resolution_display||'—';
+  const cEl=document.getElementById('dbg-cam');cEl.textContent=d.camera_ok?'Aktywna':'Brak';cEl.style.color=d.camera_ok?'var(--lime)':'var(--red)';
+  document.getElementById('dbg-src').textContent=d.camera_source_label||'—';
+  const piR=document.getElementById('dbg-pi-row');piR.style.display=d.camera_source==='raspberryPi'?'':'none';
+  const maR=document.getElementById('dbg-mai-row');maR.style.display=d.camera_source==='seventyMai'?'':'none';
+  if(d.camera_source==='raspberryPi'){const el=document.getElementById('dbg-pi');el.textContent=d.pi_connected?'Połączono ('+d.pi_fps.toFixed(1)+' fps) @ '+d.pi_address:'Rozłączono @ '+d.pi_address;el.style.color=d.pi_connected?'var(--lime)':'var(--red)';}
+  if(d.camera_source==='seventyMai'){const el=document.getElementById('dbg-mai');el.textContent=d.mai_connected?'Połączono ('+d.mai_fps.toFixed(1)+' fps)':'Rozłączono';el.style.color=d.mai_connected?'var(--lime)':'var(--red)';}
+  document.getElementById('dbg-lens').textContent=d.selected_lens||'—';
+  document.getElementById('dbg-snap').textContent=d.snapshot_buffer_kb>0?d.snapshot_buffer_kb+' KB':'—';
+  document.getElementById('dbg-plates').textContent=d.plate_count||0;
+  document.getElementById('dbg-logs').textContent=d.log_count||0;
+  document.getElementById('ml-count').textContent=(d.ml_log_count||0)+' wpisów';
+  const tb=document.getElementById('ml-toggle-btn');
+  if(d.ml_log_enabled){tb.innerHTML='<i class="fa-solid fa-pause"></i> Wstrzymaj';tb.style.background='rgba(229,160,13,.1)';tb.style.borderColor='rgba(229,160,13,.3)';tb.style.color='var(--orange)';}
+  else{tb.innerHTML='<i class="fa-solid fa-play"></i> Włącz';tb.style.background='rgba(184,255,53,.1)';tb.style.borderColor='rgba(184,255,53,.3)';tb.style.color='var(--lime)';}
+  const lc=document.getElementById('ml-log-content');
+  if(d.ml_log_entries&&d.ml_log_entries.length>0){
+    lc.innerHTML=d.ml_log_entries.map(e=>{let c='var(--muted)';if(e.includes('❌'))c='var(--red)';else if(e.includes('⚠'))c='var(--orange)';else if(e.includes('✅'))c='var(--lime)';else if(e.includes('📷')||e.includes('🔍'))c='var(--azure)';else if(e.includes('🧠')||e.includes('⏱'))c='var(--purple)';return'<div style="color:'+c+'">'+e.replace(/</g,'&lt;')+'</div>';}).join('');
+    document.getElementById('ml-log-wrap').scrollTop=document.getElementById('ml-log-wrap').scrollHeight;
+  }else{lc.innerHTML='<span style="color:var(--muted)">Brak logów ML</span>';}
+  }catch(e){console.error('loadDebug:',e);}
+}
+async function toggleML(){await api('POST','/api/ml_log/toggle');loadDebug();}
+async function clearML(){await api('POST','/api/ml_log/clear');loadDebug();}
+function copyML(){const el=document.getElementById('ml-log-content');navigator.clipboard.writeText(el.innerText).then(()=>{const b=document.getElementById('ml-copy-btn');b.innerHTML='<i class="fa-solid fa-check"></i> Skopiowano!';setTimeout(()=>{b.innerHTML='<i class="fa-solid fa-copy"></i> Kopiuj';},2000);});}
 
 // ── Podgląd kamery ────────────────────────────────────────────────────────────
 let _streamActive = false;
