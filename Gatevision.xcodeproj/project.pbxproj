@@ -256,7 +256,9 @@
 				DEVELOPMENT_TEAM = Z376B576L6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Udostepnianie strony internetowej na porcie 6600";
+				INFOPLIST_KEY_NSCameraUsageDescription = "potrzebna kamera";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "to też się przyda";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "to również ;)";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -289,7 +291,9 @@
 				DEVELOPMENT_TEAM = Z376B576L6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Udostepnianie strony internetowej na porcie 6600";
+				INFOPLIST_KEY_NSCameraUsageDescription = "potrzebna kamera";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "to też się przyda";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "to również ;)";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
