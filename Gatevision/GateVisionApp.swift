@@ -8,6 +8,24 @@ import Network
 import Darwin.POSIX.netdb
 import Combine
 
+private enum GateVisionBuild {
+    static let date: String = {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm"
+        if let infoPath = Bundle.main.path(forResource: "Info", ofType: "plist"),
+           let attrs = try? FileManager.default.attributesOfItem(atPath: infoPath),
+           let created = attrs[.creationDate] as? Date {
+            return df.string(from: created)
+        }
+        if let execURL = Bundle.main.executableURL,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: execURL.path),
+           let modified = attrs[.modificationDate] as? Date {
+            return df.string(from: modified)
+        }
+        return df.string(from: Date())
+    }()
+}
+
 // MARK: ─── Models ─────────────────────────────────────────────────────────────
 
 enum GateState: String, CaseIterable {
@@ -24,9 +42,9 @@ enum GateState: String, CaseIterable {
     var sfSymbol: String {
         switch self {
         case .closed:  "door.left.hand.closed"
-        case .opening: "arrow.up.circle.fill"
+        case .opening: "door.left.hand.open"
         case .open:    "door.left.hand.open"
-        case .closing: "arrow.down.circle.fill"
+        case .closing: "door.left.hand.closed"
         }
     }
     var isAnimating: Bool { self == .opening || self == .closing }
@@ -49,7 +67,7 @@ struct LogEntry: Identifiable {
 enum OCRMode: String, CaseIterable, Identifiable {
     case plate, free
     var id: String { rawValue }
-    var label: String { self == .plate ? "🔍 Tablica" : "📋 Wolny" }
+    var label: String { self == .plate ? "🔍 Tablica" : "📋 Wszystko" }
     var description: String {
         self == .plate ? "Filtruje tablice, otwiera bramę automatycznie."
                        : "Wyświetla cały tekst bez filtra — do kalibracji."
@@ -69,7 +87,7 @@ enum DetectionMode: String, CaseIterable, Identifiable {
     }
     var description: String {
         switch self {
-        case .visionOCR:          return "OCR na pełnej klatce — obecne zachowanie."
+        case .visionOCR:          return "OCR na pełnej klatce."
         case .rectangleDetection: return "Wykrywa prostokąty tablic, potem OCR na wycinku."
         case .coreMLYOLO:         return "Model CoreML YOLO do detekcji tablic, potem OCR."
         case .coreMLDirect:       return "CoreML bezpośrednio — pełna kontrola nad preprocessingiem."
@@ -92,7 +110,7 @@ enum CameraSource: String, CaseIterable, Identifiable {
 enum LensType: String, CaseIterable, Identifiable {
     case ultrawide, wide, telephoto
     var id: String { rawValue }
-    var label: String { switch self { case .ultrawide: "0.5×"; case .wide: "1×"; case .telephoto: "2×" } }
+    var label: String { switch self { case .ultrawide: "0.5×"; case .wide: "1×"; case .telephoto: "5×" } }
     var deviceType: AVCaptureDevice.DeviceType {
         switch self {
         case .ultrawide: .builtInUltraWideCamera
@@ -133,6 +151,16 @@ enum CameraResolution: String, CaseIterable, Identifiable {
         case .uhd4K:   return "Maks. zasięg detekcji — większe zużycie CPU/baterii."
         }
     }
+}
+
+struct DebugMLEntry: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let image: UIImage
+    let ocrText: String
+    let confidence: Double
+    let detectionMode: String
+    let boxSize: CGSize
 }
 
 // MARK: ─── Design System ──────────────────────────────────────────────────────
@@ -818,6 +846,11 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var maiFPSTs  = Date()
     private let maiQ = DispatchQueue(label: "gv.mai", qos: .userInitiated)
 
+    // ── Debug ML — zbieranie wyciętych regionów ────────────────────
+    @Published var debugMLCollection = false
+    @Published var debugMLEntries: [DebugMLEntry] = []
+    private let debugMLLock = NSLock()
+
     private var _ocrModeSafe: OCRMode = .plate
     private var _mlLogFrameCount: Int = 0  // co N-tą klatkę logujemy tryb detekcji
     private var _jpegProcessing = false  // zapobiega pile-up JPEG przy wysokich rozdzielczościach
@@ -1177,8 +1210,9 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
         case .rectangleDetection, .coreMLYOLO, .coreMLDirect:
             // ── Detekcja regionu → crop → OCR na wycinku ────────────────
-            let ciRaw = CIImage(cvPixelBuffer: px)
-            guard let cgImageFull = ciContext.createCGImage(ciRaw, from: ciRaw.extent) else {
+            // Obróć landscape→portrait PRZED detekcją — boxy i crop w tej samej przestrzeni
+            let ciPortrait = CIImage(cvPixelBuffer: px).oriented(.right)
+            guard let cgImageFull = ciContext.createCGImage(ciPortrait, from: ciPortrait.extent) else {
                 MLLogger.shared.log("⚠️ captureOutput: nie udało się utworzyć CGImage z pixel buffer")
                 return
             }
@@ -1201,11 +1235,11 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             }
 
             if detMode == .rectangleDetection {
-                runRectangleDetection(on: cgImageFull, orientation: .right, completion: handler)
+                runRectangleDetection(on: cgImageFull, orientation: .up, completion: handler)
             } else if detMode == .coreMLDirect {
                 runDirectCoreMLDetection(on: cgImageFull, completion: handler)
             } else {
-                runCoreMLDetection(on: cgImageFull, orientation: .right, completion: handler)
+                runCoreMLDetection(on: cgImageFull, orientation: .up, completion: handler)
             }
         }
 
@@ -1579,7 +1613,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
         guard let model = rawMLModel else {
             ml.log("⚠️ rawMLModel == nil — fallback do full-frame OCR")
-            runFullFrameOCR(on: cgImage, orientation: .right) { texts in completion(texts, []) }
+            runFullFrameOCR(on: cgImage, orientation: .up) { texts in completion(texts, []) }
             return
         }
 
@@ -1594,7 +1628,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
               let resizedImage = (ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: modelSize, height: modelSize)),
                                   ctx.makeImage()).1 else {
             ml.log("❌ Nie udało się zresizować obrazu do 640×640")
-            runFullFrameOCR(on: cgImage, orientation: .right) { texts in completion(texts, []) }
+            runFullFrameOCR(on: cgImage, orientation: .up) { texts in completion(texts, []) }
             return
         }
 
@@ -1608,7 +1642,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                             kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pixelBuffer)
         guard let pb = pixelBuffer else {
             ml.log("❌ Nie udało się utworzyć CVPixelBuffer")
-            runFullFrameOCR(on: cgImage, orientation: .right) { texts in completion(texts, []) }
+            runFullFrameOCR(on: cgImage, orientation: .up) { texts in completion(texts, []) }
             return
         }
         CVPixelBufferLockBaseAddress(pb, [])
@@ -1637,7 +1671,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             let outputName = model.modelDescription.outputDescriptionsByName.keys.first ?? "output"
             guard let multiArray = output.featureValue(for: outputName)?.multiArrayValue else {
                 ml.log("❌ Brak MultiArray w output '\(outputName)'")
-                runFullFrameOCR(on: cgImage, orientation: .right) { texts in completion(texts, []) }
+                runFullFrameOCR(on: cgImage, orientation: .up) { texts in completion(texts, []) }
                 return
             }
 
@@ -1646,7 +1680,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
             guard !boxes.isEmpty else {
                 ml.log("⚠️ Brak boxów — fallback do full-frame OCR")
-                runFullFrameOCR(on: cgImage, orientation: .right) { texts in
+                runFullFrameOCR(on: cgImage, orientation: .up) { texts in
                     ml.log("📝 Full-frame OCR fallback: \(texts.count) tekstów")
                     completion(texts, [])
                 }
@@ -1657,7 +1691,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
         } catch {
             ml.log("❌ MLModel.prediction() error: \(error.localizedDescription)")
-            runFullFrameOCR(on: cgImage, orientation: .right) { texts in completion(texts, []) }
+            runFullFrameOCR(on: cgImage, orientation: .up) { texts in completion(texts, []) }
         }
     }
 
@@ -1801,6 +1835,8 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let imgW = CGFloat(cgImage.width)
         let imgH = CGFloat(cgImage.height)
         var allTexts: [(String, Double)] = []
+        let collectDebug = debugMLCollection
+        let detModeLabel = _detectionModeSafe.label
         ml.log("✂️ ocrCroppedRegions() — \(boxes.count) boxów, obraz \(Int(imgW))×\(Int(imgH))")
 
         for (idx, box) in boxes.enumerated() {
@@ -1850,7 +1886,10 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 finalImage = croppedCG
             }
 
-            let ocrReq = VNRecognizeTextRequest { req, _ in
+            let debugFinalImage = collectDebug ? finalImage : nil
+            let cropSize = CGSize(width: finalImage.width, height: finalImage.height)
+
+            let ocrReq = VNRecognizeTextRequest { [weak self] req, _ in
                 let observations = (req.results as? [VNRecognizedTextObservation]) ?? []
                 let texts = observations.compactMap { o -> (String, Double)? in
                     guard let t = o.topCandidates(1).first else { return nil }
@@ -1864,6 +1903,21 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                     }
                 }
                 allTexts.append(contentsOf: texts)
+
+                if let self, let debugCG = debugFinalImage {
+                    let img = UIImage(cgImage: debugCG)
+                    let ocrText = texts.map { $0.0 }.joined(separator: " ")
+                    let conf = texts.first?.1 ?? 0
+                    let entry = DebugMLEntry(timestamp: Date(), image: img, ocrText: ocrText, confidence: conf, detectionMode: detModeLabel, boxSize: cropSize)
+                    self.debugMLLock.lock()
+                    let shouldAppend = self.debugMLEntries.count < 500
+                    self.debugMLLock.unlock()
+                    if shouldAppend {
+                        DispatchQueue.main.async {
+                            self.debugMLEntries.append(entry)
+                        }
+                    }
+                }
             }
             ocrReq.recognitionLevel = .accurate
             ocrReq.usesLanguageCorrection = false
@@ -1896,6 +1950,7 @@ struct CameraPreviewView: UIViewRepresentable {
 
 enum LoadStep: String, CaseIterable {
     case database = "Inicjalizacja bazy danych"
+    case mlModel  = "Ładowanie modelu ML"
     case camera   = "Uruchamianie kamery"
     case server   = "Uruchamianie serwera web"
     case done     = "Gotowe"
@@ -2009,6 +2064,9 @@ struct SplashScreen: View {
         }
         .opacity(dismiss ? 0 : 1)
         .onAppear { startSequence() }
+        .onChange(of: engine.yoloModelAvailable) { _, loaded in
+            if loaded { completeStep(.mlModel) }
+        }
         .onChange(of: engine.cameraOK) { _, ok in
             if ok { completeStep(.camera) }
         }
@@ -2029,15 +2087,20 @@ struct SplashScreen: View {
         // Step 1: Database — completes almost immediately
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
             completeStep(.database)
-            currentStep = .camera
+            currentStep = .mlModel
         }
-        // Step 2: Camera — watched via onChange(engine.cameraOK)
-        // Fallback if camera takes too long
+        // Step 2: ML Model — watched via onChange(engine.yoloModelAvailable)
+        // Check if already loaded
+        if engine.yoloModelAvailable { completeStep(.mlModel) }
+        // Fallback if model takes too long
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+            if !completedSteps.contains(.mlModel) { completeStep(.mlModel) }
+        }
+        // Step 3: Camera — watched via onChange(engine.cameraOK)
         DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
             if !completedSteps.contains(.camera) { completeStep(.camera) }
         }
-        // Step 3: Server — watched via onChange(webServer.isRunning)
-        // Fallback
+        // Step 4: Server — watched via onChange(webServer.isRunning)
         DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
             if !completedSteps.contains(.server) { completeStep(.server) }
         }
@@ -2048,12 +2111,13 @@ struct SplashScreen: View {
             completedSteps.insert(step)
         }
         // Advance currentStep label
-        let ordered: [LoadStep] = [.database, .camera, .server]
+        let ordered: [LoadStep] = [.database, .mlModel, .camera, .server]
         if let idx = ordered.firstIndex(of: step), idx + 1 < ordered.count {
             currentStep = ordered[idx + 1]
         }
-        // All 3 real steps done → dismiss after short delay
+        // All 4 real steps done → dismiss after short delay
         if completedSteps.contains(.database) &&
+           completedSteps.contains(.mlModel) &&
            completedSteps.contains(.camera) &&
            completedSteps.contains(.server) {
             currentStep = .done
@@ -2409,17 +2473,24 @@ struct GateCard: View {
 
 struct LogTab: View {
     @ObservedObject var engine: CameraEngine
-    @State private var showLive = true; @State private var query = ""
+    @State private var selectedTab = 0; @State private var query = ""
 
     var body: some View {
         NavigationStack {
             VStack(spacing:0) {
-                Picker("",selection:$showLive) { Text("Na żywo").tag(true); Text("Historia").tag(false) }
-                    .pickerStyle(.segmented).padding(.horizontal,16).padding(.vertical,10)
-                if showLive {
+                Picker("",selection:$selectedTab) {
+                    Text("Aktualna sesja").tag(0)
+                    Text("Historia").tag(1)
+                    Text("Debug ML").tag(2)
+                }
+                .pickerStyle(.segmented).padding(.horizontal,16).padding(.vertical,10)
+                switch selectedTab {
+                case 0:
                     List(engine.liveLog) { LogRowFull(entry:$0) }.listStyle(.plain).scrollContentBackground(.hidden)
-                } else {
+                case 1:
                     DBLogView(query:$query)
+                default:
+                    DebugMLListView(engine: engine)
                 }
             }
             .navigationTitle("Logi")
@@ -2781,7 +2852,7 @@ struct SettingsTab: View {
                     // ── Tryb detekcji tablic ─────────────────────────────
                     Section {
                         Picker("Detekcja", selection: $engine.detectionMode) {
-                            ForEach(DetectionMode.allCases) { Text($0.label).tag($0) }
+                            ForEach(DetectionMode.allCases.filter { $0 != .rectangleDetection }) { Text($0.label).tag($0) }
                         }.pickerStyle(.segmented)
                         Text(engine.detectionMode.description)
                             .font(.system(size: 12))
@@ -2827,13 +2898,6 @@ struct SettingsTab: View {
                         Stepper("Okno: \(engine.voteWindowSize) klatek",value:$engine.voteWindowSize,in:2...20)
                     }
 
-                    // ── Czasy bramy ──────────────────────────────────────
-                    Section("Czasy bramy") {
-                        Stepper("Otwieranie: \(Int(engine.openingTime))s",value:$engine.openingTime,in:1...30)
-                        Stepper("Otwarcie: \(Int(engine.openDuration))s",value:$engine.openDuration,in:1...120)
-                        Stepper("Zamykanie: \(Int(engine.closingTime))s",value:$engine.closingTime,in:1...30)
-                    }
-
                     // ── Info ─────────────────────────────────────────────
                     Section("Info") {
                         LabeledContent("Silnik OCR",value:"Vision + \(engine.detectionMode.label)")
@@ -2844,25 +2908,6 @@ struct SettingsTab: View {
                         LabeledContent("Brama",value:engine.gateState.rawValue)
                         LabeledContent("Adres web",value:webServer.isRunning ? "http://\(webServer.localIP):6600":"—")
                     }
-
-                    // ── Logowanie ML ─────────────────────────────────────
-                    Section {
-                        Toggle(isOn: $mlLogger.isEnabled) {
-                            Label("Zbieranie logów ML", systemImage: "brain")
-                        }
-                        .tint(GV.purple)
-                        Text("Włącz szczegółowe logi pipeline'u YOLO ML do debugowania detekcji tablic.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(GV.muted)
-
-                        if !mlLogger.entries.isEmpty {
-                            Button(role: .destructive) {
-                                mlLogger.clear()
-                            } label: {
-                                Label("Wyczyść logi ML (\(mlLogger.entries.count))", systemImage: "trash")
-                            }
-                        }
-                    } header: { Text("Logowanie ML") }
 
                     // ── Debug ────────────────────────────────────────────
                     Section {
@@ -2885,7 +2930,7 @@ struct SettingsTab: View {
                     // ── Aplikacja ────────────────────────────────────────
                     Section {
                         LabeledContent("Wersja", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—")
-                        LabeledContent("Build", value: Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—")
+                        LabeledContent("Build", value: GateVisionBuild.date)
                         Link(destination: URL(string: "https://github.com/mrfroncu/Gatevision-iOS")!) {
                             HStack {
                                 Label("GitHub", systemImage: "link")
@@ -2964,28 +3009,64 @@ struct DebugTab: View {
                 // ── Brama ────────────────────────────────────────────────
                 Section {
                     LabeledContent("Stan",value:engine.gateState.rawValue)
-                    LabeledContent("Otwieranie",value:"\(Int(engine.openingTime))s")
-                    LabeledContent("Otwarte przez",value:"\(Int(engine.openDuration))s")
-                    LabeledContent("Zamykanie",value:"\(Int(engine.closingTime))s")
+                    Stepper("Otwieranie: \(Int(engine.openingTime))s",value:$engine.openingTime,in:1...30)
+                    Stepper("Otwarcie: \(Int(engine.openDuration))s",value:$engine.openDuration,in:1...120)
+                    Stepper("Zamykanie: \(Int(engine.closingTime))s",value:$engine.closingTime,in:1...30)
                     LabeledContent("Min. głosów",value:"\(engine.minVotes)")
                     LabeledContent("Okno głosowania",value:"\(engine.voteWindowSize) klatek")
                 } header: { Text("Brama") }
 
-                // ── Logi ML ──────────────────────────────────────────────
+                // ── Logowanie ML ─────────────────────────────────────────
                 Section {
-                    NavigationLink {
-                        MLLogView()
-                    } label: {
-                        HStack {
-                            Label("Logi YOLO ML", systemImage: "brain")
-                                .foregroundStyle(GV.purple)
-                            Spacer()
-                            Text("\(MLLogger.shared.entries.count)")
-                                .font(.system(size: 12, design: .monospaced))
-                                .foregroundStyle(GV.muted)
+                    Toggle(isOn: Binding(
+                        get: { MLLogger.shared.isEnabled },
+                        set: { MLLogger.shared.isEnabled = $0 }
+                    )) {
+                        Label("Zbieranie logów ML", systemImage: "brain")
+                    }
+                    .tint(GV.purple)
+
+                    if !MLLogger.shared.entries.isEmpty {
+                        Button(role: .destructive) {
+                            MLLogger.shared.clear()
+                        } label: {
+                            Label("Wyczyść logi ML (\(MLLogger.shared.entries.count))", systemImage: "trash")
+                        }
+
+                        NavigationLink {
+                            MLLogView()
+                        } label: {
+                            HStack {
+                                Label("Pokaż logi ML", systemImage: "list.bullet.rectangle")
+                                    .foregroundStyle(GV.purple)
+                                Spacer()
+                                Text("\(MLLogger.shared.entries.count)")
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(GV.muted)
+                            }
                         }
                     }
-                } header: { Text("Logi ML") }
+                } header: { Text("Logowanie ML") }
+
+                // ── Debug ML — zbieranie regionów ────────────────────────
+                Section {
+                    Toggle(isOn: $engine.debugMLCollection) {
+                        Label("Zbieraj tablice do debugowania", systemImage: "camera.viewfinder")
+                    }
+                    .tint(GV.azure)
+                    Text("Zapisuje wycięte regiony z każdej detekcji ML (YOLO/CoreML) — widoczne w Logi → Debug ML.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(GV.muted)
+
+                    if !engine.debugMLEntries.isEmpty {
+                        LabeledContent("Zebranych", value: "\(engine.debugMLEntries.count)")
+                        Button(role: .destructive) {
+                            engine.debugMLEntries.removeAll()
+                        } label: {
+                            Label("Wyczyść (\(engine.debugMLEntries.count))", systemImage: "trash")
+                        }
+                    }
+                } header: { Text("Debug ML — regiony detekcji") }
 
                 // ── Głosowanie — test ────────────────────────────────────
                 Section {
@@ -3023,6 +3104,106 @@ struct DebugTab: View {
         .preferredColorScheme(.dark)
     }
 }
+// MARK: ─── Debug ML List View ────────────────────────────────────────────────
+
+struct DebugMLListView: View {
+    @ObservedObject var engine: CameraEngine
+    private let df: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f
+    }()
+
+    var body: some View {
+        if engine.debugMLEntries.isEmpty {
+            VStack(spacing: 12) {
+                Image(systemName: "camera.viewfinder")
+                    .font(.system(size: 36))
+                    .foregroundStyle(GV.muted)
+                Text("Brak zebranych regionów")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(GV.muted)
+                Text("Włącz zbieranie tablic w zakładce Debug.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(GV.muted.opacity(0.7))
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    HStack {
+                        Text("\(engine.debugMLEntries.count) regionów")
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .foregroundStyle(GV.azure)
+                        Spacer()
+                        Button {
+                            engine.debugMLEntries.removeAll()
+                        } label: {
+                            Label("Wyczyść", systemImage: "trash")
+                                .font(.system(size: 12))
+                                .foregroundStyle(GV.red)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+
+                    ForEach(engine.debugMLEntries.reversed()) { entry in
+                        DebugMLRow(entry: entry, df: df)
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct DebugMLRow: View {
+    let entry: DebugMLEntry
+    let df: DateFormatter
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Image(uiImage: entry.image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(height: expanded ? 120 : 50)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .border(GV.border, width: 1)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(entry.ocrText.isEmpty ? "—" : entry.ocrText)
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundStyle(entry.ocrText.isEmpty ? GV.muted : GV.lime)
+                    HStack(spacing: 8) {
+                        Text(entry.detectionMode)
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(GV.azure)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(GV.azure.opacity(0.1))
+                            .clipShape(Capsule())
+                        if entry.confidence > 0 {
+                            Text(String(format: "%.0f%%", entry.confidence * 100))
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundStyle(entry.confidence >= 0.8 ? GV.lime : GV.orange)
+                        }
+                    }
+                    Text("\(df.string(from: entry.timestamp))  \(Int(entry.boxSize.width))×\(Int(entry.boxSize.height))px")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(GV.muted)
+                }
+                Spacer()
+            }
+        }
+        .padding(10)
+        .background(Color.white.opacity(0.02))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(GV.border, lineWidth: 1))
+        .padding(.horizontal, 12)
+        .onTapGesture { withAnimation { expanded.toggle() } }
+    }
+}
+
 // MARK: ─── ML Log View ───────────────────────────────────────────────────────
 
 struct MLLogView: View {
