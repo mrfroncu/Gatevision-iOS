@@ -57,13 +57,14 @@ enum OCRMode: String, CaseIterable, Identifiable {
 }
 
 enum DetectionMode: String, CaseIterable, Identifiable {
-    case visionOCR, rectangleDetection, coreMLYOLO
+    case visionOCR, rectangleDetection, coreMLYOLO, coreMLDirect
     var id: String { rawValue }
     var label: String {
         switch self {
         case .visionOCR:          return "Pełna klatka"
         case .rectangleDetection: return "Prostokąty"
         case .coreMLYOLO:         return "YOLO ML"
+        case .coreMLDirect:       return "CoreML"
         }
     }
     var description: String {
@@ -71,6 +72,7 @@ enum DetectionMode: String, CaseIterable, Identifiable {
         case .visionOCR:          return "OCR na pełnej klatce — obecne zachowanie."
         case .rectangleDetection: return "Wykrywa prostokąty tablic, potem OCR na wycinku."
         case .coreMLYOLO:         return "Model CoreML YOLO do detekcji tablic, potem OCR."
+        case .coreMLDirect:       return "CoreML bezpośrednio — pełna kontrola nad preprocessingiem."
         }
     }
 }
@@ -96,6 +98,39 @@ enum LensType: String, CaseIterable, Identifiable {
         case .ultrawide: .builtInUltraWideCamera
         case .wide:      .builtInWideAngleCamera
         case .telephoto: .builtInTelephotoCamera
+        }
+    }
+}
+
+enum CameraResolution: String, CaseIterable, Identifiable {
+    case hd720p, hd1080p, uhd4K
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .hd720p:  return "720p"
+        case .hd1080p: return "1080p"
+        case .uhd4K:   return "4K"
+        }
+    }
+    var preset: AVCaptureSession.Preset {
+        switch self {
+        case .hd720p:  return .hd1280x720
+        case .hd1080p: return .hd1920x1080
+        case .uhd4K:   return .hd4K3840x2160
+        }
+    }
+    var displaySize: String {
+        switch self {
+        case .hd720p:  return "1280 × 720"
+        case .hd1080p: return "1920 × 1080"
+        case .uhd4K:   return "3840 × 2160"
+        }
+    }
+    var description: String {
+        switch self {
+        case .hd720p:  return "Niska latencja, mniejsze zużycie baterii."
+        case .hd1080p: return "Balans jakości i wydajności."
+        case .uhd4K:   return "Maks. zasięg detekcji — większe zużycie CPU/baterii."
         }
     }
 }
@@ -163,8 +198,6 @@ final class Database {
             owner_name TEXT DEFAULT '',is_fleet INTEGER DEFAULT 0,
             snapshot_jpeg BLOB,
             timestamp TEXT DEFAULT (datetime('now','localtime')));
-        -- migracja dla istniejących baz danych
-        ALTER TABLE access_log ADD COLUMN snapshot_jpeg BLOB;
         INSERT OR IGNORE INTO plates(plate,owner_name,is_fleet,blocked) VALUES
             ('WA12345','Jan Kowalski',0,0),('KR99999','Flota firmowa',1,0),
             ('PO55123','Anna Nowak',0,0),('GD00001','Tomasz Więcek',0,1);
@@ -271,6 +304,13 @@ final class Database {
 
     func clearLog() { dbQueue.sync { _ = exec("DELETE FROM access_log") } }
 
+    func plateCount() -> Int {
+        dbQueue.sync { query("SELECT COUNT(*) FROM plates") { Int(sqlite3_column_int($0, 0)) }.first ?? 0 }
+    }
+    func logCount() -> Int {
+        dbQueue.sync { query("SELECT COUNT(*) FROM access_log") { Int(sqlite3_column_int($0, 0)) }.first ?? 0 }
+    }
+
     func fetchSnapshot(logId: Int64) -> Data? {
         dbQueue.sync {
             var stmt: OpaquePointer?
@@ -283,6 +323,51 @@ final class Database {
             guard bytes > 0, let ptr = sqlite3_column_blob(stmt,0) else { return nil }
             return Data(bytes: ptr, count: Int(bytes))
         }
+    }
+}
+
+// MARK: ─── ML Logger ──────────────────────────────────────────────────────────
+
+/// Zbiera szczegółowe logi z pipeline'u YOLO ML do debugowania
+final class MLLogger: ObservableObject {
+    static let shared = MLLogger()
+    @Published var entries: [String] = []
+    @Published var isEnabled: Bool = UserDefaults.standard.bool(forKey: "mlLoggingEnabled") {
+        didSet { UserDefaults.standard.set(isEnabled, forKey: "mlLoggingEnabled") }
+    }
+    private let lock = NSLock()
+    private let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
+    private init() {}
+
+    func log(_ message: String) {
+        guard isEnabled else { return }
+        let ts = dateFormatter.string(from: Date())
+        let line = "[\(ts)] \(message)"
+        lock.lock()
+        let entry = line
+        lock.unlock()
+        DispatchQueue.main.async {
+            self.entries.append(entry)
+            // Ogranicz do 2000 wpisów
+            if self.entries.count > 2000 {
+                self.entries.removeFirst(self.entries.count - 2000)
+            }
+        }
+    }
+
+    func clear() {
+        DispatchQueue.main.async {
+            self.entries.removeAll()
+        }
+    }
+
+    var fullText: String {
+        entries.joined(separator: "\n")
     }
 }
 
@@ -450,6 +535,10 @@ final class WebServer: ObservableObject {
             status["detection_mode"]   = e?.detectionMode.rawValue ?? "visionOCR"
             status["selected_lens"]    = e?.selectedLens.rawValue ?? "wide"
             status["available_lenses"] = e?.availableLenses.map { $0.rawValue } ?? ["wide"]
+            status["camera_resolution"] = e?.cameraResolution.rawValue ?? "hd720p"
+            status["camera_source"]    = e?.cameraSource.rawValue ?? "iphone"
+            status["pi_connected"]     = e?.piConnected ?? false
+            status["mai_connected"]    = e?.maiConnected ?? false
             status["engine"]           = "Apple Vision"
             return (200, "application/json", j(status))
 
@@ -532,6 +621,10 @@ final class WebServer: ObservableObject {
                 "yolo_model_loaded": e.yoloModelAvailable,
                 "selected_lens":     e.selectedLens.rawValue,
                 "available_lenses":  e.availableLenses.map { $0.rawValue },
+                "camera_resolution": e.cameraResolution.rawValue,
+                "camera_source":     e.cameraSource.rawValue,
+                "pi_address":        e.piAddress,
+                "mai_rtsp_url":      e.maiRtspURL,
                 "min_votes":         e.minVotes,
                 "vote_window":       e.voteWindowSize,
                 "gate_open_duration":e.openDuration,
@@ -550,8 +643,58 @@ final class WebServer: ObservableObject {
                 if let v = obj["gate_open_duration"] as? Double { e.openDuration = v }
                 if let v = obj["gate_opening_time"] as? Double { e.openingTime = v }
                 if let v = obj["gate_closing_time"] as? Double { e.closingTime = v }
+                if let v = obj["camera_resolution"] as? String, let r = CameraResolution(rawValue: v) { e.cameraResolution = r }
+                if let v = obj["camera_source"] as? String, let s = CameraSource(rawValue: v) { e.cameraSource = s }
+                if let v = obj["pi_address"] as? String, !v.isEmpty { e.piAddress = v }
+                if let v = obj["mai_rtsp_url"] as? String, !v.isEmpty { e.maiRtspURL = v }
             }
             return (200, "application/json", j(["ok":true]))
+
+        case ("GET", "/api/debug"):
+            let ml = MLLogger.shared
+            let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+            let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
+            let info: [String: Any] = [
+                "app_version": version,
+                "app_build": build,
+                "ocr_fps": e?.ocrFPS ?? 0,
+                "ocr_engine": "Apple Vision (.accurate/.fast)",
+                "ocr_language": "en-US",
+                "detection_mode": e?.detectionMode.rawValue ?? "visionOCR",
+                "detection_mode_label": e?.detectionMode.label ?? "Pełna klatka",
+                "yolo_model_loaded": e?.yoloModelAvailable ?? false,
+                "camera_ok": e?.cameraOK ?? false,
+                "camera_source": e?.cameraSource.rawValue ?? "iphone",
+                "camera_source_label": e?.cameraSource.label ?? "iPhone",
+                "camera_resolution": e?.cameraResolution.rawValue ?? "hd720p",
+                "camera_resolution_display": e?.cameraResolution.displaySize ?? "1280 × 720",
+                "selected_lens": e?.selectedLens.label ?? "1×",
+                "available_lenses": e?.availableLenses.map { $0.label } ?? [],
+                "detected_boxes": e?.detectedBoxes.count ?? 0,
+                "snapshot_buffer_kb": (e?.latestJpeg?.count ?? 0) / 1024,
+                "gate_state": e?.gateState.rawValue ?? "ZAMKNIĘTA",
+                "pi_connected": e?.piConnected ?? false,
+                "pi_address": e?.piAddress ?? "",
+                "pi_fps": e?.piFPS ?? 0,
+                "mai_connected": e?.maiConnected ?? false,
+                "mai_rtsp_url": e?.maiRtspURL ?? "",
+                "mai_fps": e?.maiFPS ?? 0,
+                "plate_count": db.plateCount(),
+                "log_count": db.logCount(),
+                "ml_log_enabled": ml.isEnabled,
+                "ml_log_count": ml.entries.count,
+                "ml_log_entries": Array(ml.entries.suffix(500))
+            ]
+            return (200, "application/json", j(info))
+
+        case ("POST", "/api/ml_log/clear"):
+            DispatchQueue.main.async { MLLogger.shared.clear() }
+            return (200, "application/json", j(["ok": true]))
+
+        case ("POST", "/api/ml_log/toggle"):
+            let newState = !MLLogger.shared.isEnabled
+            DispatchQueue.main.async { MLLogger.shared.isEnabled = newState }
+            return (200, "application/json", j(["ok": true, "enabled": newState]))
 
         default:
             return (404, "text/plain", Data("Not Found".utf8))
@@ -614,6 +757,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
     // ── CoreML YOLO model ─────────────────────────────────────────────
     private var yoloModel: VNCoreMLModel?
+    private var rawMLModel: MLModel?
     private var yoloModelLoaded = false
     @Published var yoloModelAvailable = false
 
@@ -625,6 +769,14 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private let ciContext = CIContext(options:[.useSoftwareRenderer: false])  // GPU, singleton
     @Published var selectedLens: LensType = .wide  { didSet { switchLens(to: selectedLens) } }
     @Published var availableLenses: [LensType] = []
+
+    // ── Rozdzielczość kamery ──────────────────────────────────────────
+    @Published var cameraResolution: CameraResolution = CameraResolution(rawValue: UserDefaults.standard.string(forKey: "cameraResolution") ?? "") ?? .hd720p {
+        didSet {
+            UserDefaults.standard.set(cameraResolution.rawValue, forKey: "cameraResolution")
+            if cameraSource == .iphone { sessionQ.async { self._startSession(lens: self.selectedLens) } }
+        }
+    }
     @Published var openDuration = 10.0
     @Published var openingTime = 2.0
     @Published var closingTime = 3.0
@@ -667,6 +819,9 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private let maiQ = DispatchQueue(label: "gv.mai", qos: .userInitiated)
 
     private var _ocrModeSafe: OCRMode = .plate
+    private var _mlLogFrameCount: Int = 0  // co N-tą klatkę logujemy tryb detekcji
+    private var _jpegProcessing = false  // zapobiega pile-up JPEG przy wysokich rozdzielczościach
+    private var _ocrProcessing = false   // zapobiega pile-up OCR/YOLO przy wysokich rozdzielczościach
     private let session = AVCaptureSession(); private let videoOut = AVCaptureVideoDataOutput()
     private let sessionQ = DispatchQueue(label:"gv.sess", qos:.userInitiated)
     private let ocrQ     = DispatchQueue(label:"gv.ocr",  qos:.userInitiated)
@@ -681,13 +836,17 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
     override init() {
         super.init()
-        // Odczytaj tryb detekcji z UserDefaults
+        // Odczytaj tryb detekcji z UserDefaults (domyślnie visionOCR)
         if let saved = UserDefaults.standard.string(forKey: "detectionMode"),
            let mode = DetectionMode(rawValue: saved) {
-            detectionMode = mode
             _detectionModeSafe = mode
+            // Ustaw Published bez triggerowania didSet (nie nadpisuje UserDefaults)
+            DispatchQueue.main.async { self.detectionMode = mode }
         }
-        loadYOLOModelIfNeeded()
+        // Ładuj model CoreML w tle żeby nie blokować startu
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.loadYOLOModelIfNeeded()
+        }
         let avail = LensType.allCases.filter { AVCaptureDevice.default($0.deviceType, for:.video, position:.back) != nil }
         DispatchQueue.main.async { self.availableLenses = avail }
         switch cameraSource {
@@ -894,6 +1053,11 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let detMode = _detectionModeSafe
         let ocrMode = _ocrModeSafe
 
+        _mlLogFrameCount += 1
+        if _mlLogFrameCount % 30 == 1 {
+            MLLogger.shared.log("📷 externalFrame klatka #\(_mlLogFrameCount), tryb=\(detMode.label), ocrMode=\(ocrMode.rawValue), obraz=\(cgImage.width)×\(cgImage.height)")
+        }
+
         piQ.async { [weak self] in
             guard let self else { return }
 
@@ -918,7 +1082,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 req.recognitionLanguages = ["en-US"]
                 try? VNImageRequestHandler(cgImage: cgImage, orientation: .up).perform([req])
 
-            case .rectangleDetection, .coreMLYOLO:
+            case .rectangleDetection, .coreMLYOLO, .coreMLDirect:
                 // ── Detekcja regionu → crop → OCR ────────────────────────
                 let handler: ([(String, Double)], [CGRect]) -> Void = { [weak self] texts, boxes in
                     guard let self else { return }
@@ -934,6 +1098,8 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
                 if detMode == .rectangleDetection {
                     self.runRectangleDetection(on: cgImage, orientation: .up, completion: handler)
+                } else if detMode == .coreMLDirect {
+                    self.runDirectCoreMLDetection(on: cgImage, completion: handler)
                 } else {
                     self.runCoreMLDetection(on: cgImage, orientation: .up, completion: handler)
                 }
@@ -943,7 +1109,8 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
     private func _startSession(lens: LensType) {
         session.beginConfiguration(); session.inputs.forEach { session.removeInput($0) }
-        session.sessionPreset = .hd1280x720
+        let desiredPreset = cameraResolution.preset
+        session.sessionPreset = session.canSetSessionPreset(desiredPreset) ? desiredPreset : .hd1280x720
         let device = AVCaptureDevice.default(lens.deviceType, for:.video, position:.back)
                   ?? AVCaptureDevice.default(.builtInWideAngleCamera, for:.video, position:.back)
         guard let device, let input = try? AVCaptureDeviceInput(device:device), session.canAddInput(input) else {
@@ -966,6 +1133,8 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from conn: AVCaptureConnection) {
         guard let px = CMSampleBufferGetImageBuffer(sb) else { return }
         ocrCnt += 1; let now = Date()
+        // Pomijaj klatkę gdy poprzednia jeszcze się przetwarza (zapobiega pile-up pamięci)
+        guard !_ocrProcessing else { return }
         if now.timeIntervalSince(fpsMeasureTs) >= 3 {
             let fps = Double(ocrCnt) / now.timeIntervalSince(fpsMeasureTs)
             ocrCnt = 0; fpsMeasureTs = now
@@ -974,6 +1143,9 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
         let detMode = _detectionModeSafe
         let ocrMode = _ocrModeSafe
+
+        _ocrProcessing = true
+        defer { _ocrProcessing = false }  // ZAWSZE resetuj — perform() jest synchroniczny
 
         switch detMode {
         case .visionOCR:
@@ -1003,10 +1175,18 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             req.recognitionLevel = .fast; req.usesLanguageCorrection = false; req.recognitionLanguages = ["en-US"]
             try? VNImageRequestHandler(cvPixelBuffer: px, orientation: .right).perform([req])
 
-        case .rectangleDetection, .coreMLYOLO:
+        case .rectangleDetection, .coreMLYOLO, .coreMLDirect:
             // ── Detekcja regionu → crop → OCR na wycinku ────────────────
-            let ciImage = CIImage(cvPixelBuffer: px)
-            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+            let ciRaw = CIImage(cvPixelBuffer: px)
+            guard let cgImageFull = ciContext.createCGImage(ciRaw, from: ciRaw.extent) else {
+                MLLogger.shared.log("⚠️ captureOutput: nie udało się utworzyć CGImage z pixel buffer")
+                return
+            }
+
+            _mlLogFrameCount += 1
+            if _mlLogFrameCount % 30 == 1 {
+                MLLogger.shared.log("📷 captureOutput klatka #\(_mlLogFrameCount), tryb=\(detMode.label), ocrMode=\(ocrMode.rawValue), obraz=\(cgImageFull.width)×\(cgImageFull.height)")
+            }
 
             let handler: ([(String, Double)], [CGRect]) -> Void = { [weak self] texts, boxes in
                 guard let self else { return }
@@ -1021,14 +1201,17 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             }
 
             if detMode == .rectangleDetection {
-                runRectangleDetection(on: cgImage, orientation: .right, completion: handler)
+                runRectangleDetection(on: cgImageFull, orientation: .right, completion: handler)
+            } else if detMode == .coreMLDirect {
+                runDirectCoreMLDetection(on: cgImageFull, completion: handler)
             } else {
-                runCoreMLDetection(on: cgImage, orientation: .right, completion: handler)
+                runCoreMLDetection(on: cgImageFull, orientation: .right, completion: handler)
             }
         }
 
         // Zapisz JPEG co ~3 klatki (~10fps dla streamu webowego)
-        guard ocrCnt % 3 == 0 else { return }
+        // Pomijaj gdy poprzedni JPEG jeszcze się przetwarza (zapobiega pile-up pamięci)
+        guard ocrCnt % 3 == 0, !_jpegProcessing else { return }
 
         // Kopia pixel buffer reference dla async processing
         let pxCopy = px
@@ -1036,27 +1219,41 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let boxes = detectedBoxes
         jpegLock.unlock()
 
+        _jpegProcessing = true
         jpegQ.async { [weak self] in
             guard let self else { return }
-            let ciRaw = CIImage(cvPixelBuffer: pxCopy)
-            let h = ciRaw.extent.height  // 720 (potrzebne do translacji po rotacji)
-            // Tylna kamera w portrecie: CVPixelBuffer = landscape (góra obrazu = prawy bok)
-            // +pi/2 (90° CW) wyprostowuje: (x,y)→(-y,x), translacja (h,0) przywraca do ćwiartki +
-            // Obrót +90° CW: (x,y)→(-y,x), translacja (h,0) → obraz wyprostowany ale mirrored
-            // Flip poziomy: scaleX=-1 z translacją (nowa_szerokość=h, 0) → usuwa mirror
-            let rotation = CGAffineTransform(rotationAngle: .pi / 2)
-                .concatenating(CGAffineTransform(translationX: h, y: 0))
-            let flipped = CGAffineTransform(scaleX: -1, y: 1)
-                .concatenating(CGAffineTransform(translationX: h, y: 0))
-            let ciRotated = ciRaw.transformed(by: rotation).transformed(by: flipped)
-            let extent = ciRotated.extent
-            guard let cgImage = self.ciContext.createCGImage(ciRotated, from: extent) else { return }
-            let outSize = CGSize(width: extent.width, height: extent.height)
-            let uiImage = self.drawBoxes(on: cgImage, boxes: boxes, size: outSize)
-            if let jpeg = uiImage.jpegData(compressionQuality: 0.55) {
-                self.jpegLock.lock()
-                self.latestJpeg = jpeg
-                self.jpegLock.unlock()
+            defer { self._jpegProcessing = false }
+            autoreleasepool {
+                let ciRaw = CIImage(cvPixelBuffer: pxCopy)
+                let h = ciRaw.extent.height
+                // Skaluj w dół snapshot do max 720p wysokości (landscape) by oszczędzić pamięć
+                let maxSnapshotH: CGFloat = 720
+                let ciScaled: CIImage
+                if h > maxSnapshotH {
+                    let scale = maxSnapshotH / h
+                    ciScaled = ciRaw.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                } else {
+                    ciScaled = ciRaw
+                }
+                let sh = ciScaled.extent.height
+                // Tylna kamera w portrecie: CVPixelBuffer = landscape (góra obrazu = prawy bok)
+                // +pi/2 (90° CW) wyprostowuje: (x,y)→(-y,x), translacja (h,0) przywraca do ćwiartki +
+                // Obrót +90° CW: (x,y)→(-y,x), translacja (h,0) → obraz wyprostowany ale mirrored
+                // Flip poziomy: scaleX=-1 z translacją (nowa_szerokość=h, 0) → usuwa mirror
+                let rotation = CGAffineTransform(rotationAngle: .pi / 2)
+                    .concatenating(CGAffineTransform(translationX: sh, y: 0))
+                let flipped = CGAffineTransform(scaleX: -1, y: 1)
+                    .concatenating(CGAffineTransform(translationX: sh, y: 0))
+                let ciRotated = ciScaled.transformed(by: rotation).transformed(by: flipped)
+                let extent = ciRotated.extent
+                guard let cgImage = self.ciContext.createCGImage(ciRotated, from: extent) else { return }
+                let outSize = CGSize(width: extent.width, height: extent.height)
+                let uiImage = self.drawBoxes(on: cgImage, boxes: boxes, size: outSize)
+                if let jpeg = uiImage.jpegData(compressionQuality: 0.55) {
+                    self.jpegLock.lock()
+                    self.latestJpeg = jpeg
+                    self.jpegLock.unlock()
+                }
             }
         }
     }
@@ -1200,18 +1397,42 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private func loadYOLOModelIfNeeded() {
         guard !yoloModelLoaded else { return }
         yoloModelLoaded = true
+        let ml = MLLogger.shared
 
-        guard let modelURL = Bundle.main.url(forResource: "PlateDetector", withExtension: "mlmodelc")
-                ?? Bundle.main.url(forResource: "PlateDetectorYOLO", withExtension: "mlmodelc") else {
+        ml.log("⏳ loadYOLOModelIfNeeded() — szukam modelu w bundle...")
+
+        // Sprawdź wszystkie zasoby .mlmodelc w bundle
+        let allURLs = Bundle.main.urls(forResourcesWithExtension: "mlmodelc", subdirectory: nil) ?? []
+        ml.log("📦 Znalezione .mlmodelc w bundle: \(allURLs.map { $0.lastPathComponent })")
+
+        guard let modelURL = Bundle.main.url(forResource: "trained_plates_detection", withExtension: "mlmodelc")
+                ?? Bundle.main.url(forResource: "PlateDetector", withExtension: "mlmodelc") else {
+            ml.log("❌ Brak modelu CoreML w bundle — szukano: trained_plates_detection.mlmodelc, PlateDetector.mlmodelc")
             print("[GateVision] ⚠️ Brak modelu CoreML w bundle — tryb YOLO niedostępny")
             return
         }
+        ml.log("📁 Znaleziono model: \(modelURL.lastPathComponent) @ \(modelURL.path)")
         do {
             let mlModel = try MLModel(contentsOf: modelURL)
+            let desc = mlModel.modelDescription
+            ml.log("✅ MLModel załadowany pomyślnie")
+            ml.log("   Inputs: \(desc.inputDescriptionsByName.keys.sorted().joined(separator: ", "))")
+            for (name, input) in desc.inputDescriptionsByName {
+                ml.log("   Input '\(name)': type=\(input.type.rawValue), \(input.imageConstraint.map { "img \($0.pixelsWide)×\($0.pixelsHigh)" } ?? input.multiArrayConstraint.map { "array \($0.shape)" } ?? "other")")
+            }
+            ml.log("   Outputs: \(desc.outputDescriptionsByName.keys.sorted().joined(separator: ", "))")
+            for (name, output) in desc.outputDescriptionsByName {
+                ml.log("   Output '\(name)': type=\(output.type.rawValue), \(output.multiArrayConstraint.map { "array shape=\($0.shape)" } ?? "other")")
+            }
+
+            rawMLModel = mlModel
             yoloModel = try VNCoreMLModel(for: mlModel)
             DispatchQueue.main.async { self.yoloModelAvailable = true }
+            ml.log("✅ VNCoreMLModel utworzony — YOLO gotowy do detekcji")
             print("[GateVision] ✅ Model CoreML załadowany: \(modelURL.lastPathComponent)")
         } catch {
+            ml.log("❌ Błąd ładowania modelu: \(error.localizedDescription)")
+            ml.log("   Pełny błąd: \(error)")
             print("[GateVision] ❌ Błąd ładowania modelu CoreML: \(error.localizedDescription)")
             yoloModel = nil
         }
@@ -1250,7 +1471,13 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 return realRatio >= 1.5 && realRatio <= 6.0
             }
 
-            guard !plateLike.isEmpty else { completion([], []); return }
+            guard !plateLike.isEmpty else {
+                // Nie znaleziono prostokątów tablic — fallback do full-frame OCR
+                self.runFullFrameOCR(on: cgImage, orientation: orientation) { texts in
+                    completion(texts, [])
+                }
+                return
+            }
 
             let boxes = plateLike.map { $0.boundingBox }
             self.ocrCroppedRegions(cgImage: cgImage, boxes: boxes, completion: completion)
@@ -1266,41 +1493,317 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
 
     /// CoreML YOLO → wycinek → OCR na wycinku
+    /// Obsługuje modele end2end (output 1×300×6: x1,y1,x2,y2,conf,class w pikselach 640×640)
+    /// oraz standardowe modele (VNRecognizedObjectObservation z normalized boundingBox).
     private func runCoreMLDetection(on cgImage: CGImage, orientation: CGImagePropertyOrientation,
                                      completion: @escaping ([(String, Double)], [CGRect]) -> Void) {
+        let ml = MLLogger.shared
+        ml.log("🔍 runCoreMLDetection() — obraz \(cgImage.width)×\(cgImage.height), orient=\(orientation.rawValue)")
+
         guard let model = yoloModel else {
-            // Fallback: brak modelu → pełna klatka OCR
+            ml.log("⚠️ yoloModel == nil — fallback do full-frame OCR")
             runFullFrameOCR(on: cgImage, orientation: orientation) { texts in
                 completion(texts, [])
             }
             return
         }
 
-        let coreMLReq = VNCoreMLRequest(model: model) { [weak self] request, _ in
+        ml.log("🧠 Wysyłam obraz do VNCoreMLRequest...")
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        let coreMLReq = VNCoreMLRequest(model: model) { [weak self] request, error in
             guard let self else { return }
-            let detections = (request.results as? [VNRecognizedObjectObservation]) ?? []
+            let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+            ml.log("⏱️ CoreML inference: \(String(format: "%.1f", elapsed)) ms")
 
-            guard !detections.isEmpty else { completion([], []); return }
+            if let error = error {
+                ml.log("❌ VNCoreMLRequest error: \(error.localizedDescription)")
+            }
 
-            let boxes = detections.map { $0.boundingBox }
+            let results = request.results ?? []
+            ml.log("📊 Wyniki: \(results.count) obiektów, typy: \(results.map { type(of: $0) }.map { String(describing: $0) })")
+            var boxes: [CGRect] = []
+
+            // Ścieżka 1: Standardowy model → VNRecognizedObjectObservation
+            if let detections = results as? [VNRecognizedObjectObservation], !detections.isEmpty {
+                ml.log("✅ Ścieżka 1: VNRecognizedObjectObservation — \(detections.count) detekcji")
+                for (i, det) in detections.enumerated() {
+                    let labels = det.labels.map { "\($0.identifier)(\(String(format: "%.2f", $0.confidence)))" }.joined(separator: ", ")
+                    ml.log("   [\(i)] bbox=\(det.boundingBox), conf=\(String(format: "%.3f", det.confidence)), labels=[\(labels)]")
+                }
+                boxes = detections.map { $0.boundingBox }
+            }
+            // Ścieżka 2: End2end YOLO → VNCoreMLFeatureValueObservation z raw tensor
+            else if let featureResults = results as? [VNCoreMLFeatureValueObservation] {
+                ml.log("📐 Ścieżka 2: VNCoreMLFeatureValueObservation — \(featureResults.count) feature(s)")
+                for (i, feat) in featureResults.enumerated() {
+                    let name = feat.featureName
+                    if let ma = feat.featureValue.multiArrayValue {
+                        ml.log("   [\(i)] name='\(name)', shape=\(ma.shape), dataType=\(ma.dataType.rawValue)")
+                    } else {
+                        ml.log("   [\(i)] name='\(name)', type=\(feat.featureValue.type.rawValue) (nie MultiArray)")
+                    }
+                }
+                boxes = self.parseEnd2EndYOLO(features: featureResults, confidenceThreshold: 0.4)
+            } else {
+                ml.log("⚠️ Nierozpoznany typ wyników: \(results.map { String(describing: type(of: $0)) })")
+            }
+
+            ml.log("📦 Łączna liczba boxów po filtracji: \(boxes.count)")
+
+            guard !boxes.isEmpty else {
+                ml.log("⚠️ Brak boxów — fallback do full-frame OCR")
+                self.runFullFrameOCR(on: cgImage, orientation: orientation) { texts in
+                    ml.log("📝 Full-frame OCR fallback: \(texts.count) tekstów")
+                    completion(texts, [])
+                }
+                return
+            }
+            ml.log("✂️ Wycinam \(boxes.count) regionów do OCR...")
             self.ocrCroppedRegions(cgImage: cgImage, boxes: boxes, completion: completion)
         }
         coreMLReq.imageCropAndScaleOption = .scaleFill
 
-        try? VNImageRequestHandler(cgImage: cgImage, orientation: orientation).perform([coreMLReq])
+        do {
+            try VNImageRequestHandler(cgImage: cgImage, orientation: orientation).perform([coreMLReq])
+        } catch {
+            ml.log("❌ VNImageRequestHandler.perform() error: \(error.localizedDescription)")
+        }
+    }
+
+    // ── CoreML Direct — bez Vision, pełna kontrola nad preprocessingiem ─────
+    private func runDirectCoreMLDetection(on cgImage: CGImage,
+                                           completion: @escaping ([(String, Double)], [CGRect]) -> Void) {
+        let ml = MLLogger.shared
+        ml.log("🔬 runDirectCoreMLDetection() — obraz \(cgImage.width)×\(cgImage.height)")
+
+        guard let model = rawMLModel else {
+            ml.log("⚠️ rawMLModel == nil — fallback do full-frame OCR")
+            runFullFrameOCR(on: cgImage, orientation: .right) { texts in completion(texts, []) }
+            return
+        }
+
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        // Ręczny resize do 640×640 przez CGContext
+        let modelSize = 640
+        guard let ctx = CGContext(data: nil, width: modelSize, height: modelSize,
+                                  bitsPerComponent: 8, bytesPerRow: modelSize * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let resizedImage = (ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: modelSize, height: modelSize)),
+                                  ctx.makeImage()).1 else {
+            ml.log("❌ Nie udało się zresizować obrazu do 640×640")
+            runFullFrameOCR(on: cgImage, orientation: .right) { texts in completion(texts, []) }
+            return
+        }
+
+        // CGImage → CVPixelBuffer
+        var pixelBuffer: CVPixelBuffer?
+        let attrs: [String: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey as String: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey as String: true
+        ]
+        CVPixelBufferCreate(kCFAllocatorDefault, modelSize, modelSize,
+                            kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pixelBuffer)
+        guard let pb = pixelBuffer else {
+            ml.log("❌ Nie udało się utworzyć CVPixelBuffer")
+            runFullFrameOCR(on: cgImage, orientation: .right) { texts in completion(texts, []) }
+            return
+        }
+        CVPixelBufferLockBaseAddress(pb, [])
+        let pbCtx = CGContext(data: CVPixelBufferGetBaseAddress(pb),
+                              width: modelSize, height: modelSize,
+                              bitsPerComponent: 8,
+                              bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                              space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        pbCtx?.draw(resizedImage, in: CGRect(x: 0, y: 0, width: modelSize, height: modelSize))
+        CVPixelBufferUnlockBaseAddress(pb, [])
+
+        ml.log("📐 CVPixelBuffer gotowy: \(CVPixelBufferGetWidth(pb))×\(CVPixelBufferGetHeight(pb))")
+
+        // MLModel.prediction() bezpośrednio
+        do {
+            let inputName = model.modelDescription.inputDescriptionsByName.keys.first ?? "image"
+            let featureValue = MLFeatureValue(pixelBuffer: pb)
+            let provider = try MLDictionaryFeatureProvider(dictionary: [inputName: featureValue])
+
+            let output = try model.prediction(from: provider)
+            let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+            ml.log("⏱️ CoreML Direct inference: \(String(format: "%.1f", elapsed)) ms")
+
+            // Parsuj output MultiArray
+            let outputName = model.modelDescription.outputDescriptionsByName.keys.first ?? "output"
+            guard let multiArray = output.featureValue(for: outputName)?.multiArrayValue else {
+                ml.log("❌ Brak MultiArray w output '\(outputName)'")
+                runFullFrameOCR(on: cgImage, orientation: .right) { texts in completion(texts, []) }
+                return
+            }
+
+            let boxes = parseDirectMLOutput(multiArray: multiArray, confidenceThreshold: 0.4)
+            ml.log("📦 CoreML Direct: \(boxes.count) boxów")
+
+            guard !boxes.isEmpty else {
+                ml.log("⚠️ Brak boxów — fallback do full-frame OCR")
+                runFullFrameOCR(on: cgImage, orientation: .right) { texts in
+                    ml.log("📝 Full-frame OCR fallback: \(texts.count) tekstów")
+                    completion(texts, [])
+                }
+                return
+            }
+            ml.log("✂️ Wycinam \(boxes.count) regionów do OCR...")
+            ocrCroppedRegions(cgImage: cgImage, boxes: boxes, completion: completion)
+
+        } catch {
+            ml.log("❌ MLModel.prediction() error: \(error.localizedDescription)")
+            runFullFrameOCR(on: cgImage, orientation: .right) { texts in completion(texts, []) }
+        }
+    }
+
+    /// Parsuje raw MLMultiArray output — ten sam format co parseEnd2EndYOLO ale bez Vision wrapper
+    private func parseDirectMLOutput(multiArray: MLMultiArray, confidenceThreshold: Float) -> [CGRect] {
+        let ml = MLLogger.shared
+        let shape = multiArray.shape.map { $0.intValue }
+        ml.log("🔢 parseDirectMLOutput() shape=\(shape)")
+
+        let numDetections: Int
+        let valuesPerDetection: Int
+        if shape.count == 3 {
+            numDetections = shape[1]; valuesPerDetection = shape[2]
+        } else if shape.count == 2 {
+            numDetections = shape[0]; valuesPerDetection = shape[1]
+        } else {
+            ml.log("❌ Nieobsługiwany shape: \(shape)")
+            return []
+        }
+
+        guard valuesPerDetection >= 5 else {
+            ml.log("❌ Za mało wartości na detekcję: \(valuesPerDetection)")
+            return []
+        }
+
+        let ptr = multiArray.dataPointer.bindMemory(to: Float.self, capacity: numDetections * valuesPerDetection)
+        let modelSize: Float = 640.0
+        var boxes: [CGRect] = []
+
+        for i in 0..<numDetections {
+            let base = i * valuesPerDetection
+            let x1 = ptr[base + 0], y1 = ptr[base + 1]
+            let x2 = ptr[base + 2], y2 = ptr[base + 3]
+            let conf = ptr[base + 4]
+            guard conf >= confidenceThreshold, x2 > x1, y2 > y1 else { continue }
+
+            let nx = CGFloat(x1 / modelSize)
+            let ny = CGFloat(1.0 - y2 / modelSize)
+            let nw = CGFloat((x2 - x1) / modelSize)
+            let nh = CGFloat((y2 - y1) / modelSize)
+            let box = CGRect(x: nx, y: ny, width: nw, height: nh)
+            ml.log("   ✅ box[\(boxes.count)]: conf=\(String(format: "%.3f", conf)), norm=\(box)")
+            boxes.append(box)
+        }
+        return boxes
+    }
+
+    /// Parsuje raw output end2end YOLO modelu (1×300×6) → normalized bounding boxy
+    /// Format: [x1, y1, x2, y2, confidence, class_id] w pikselach modelu (0-640)
+    private func parseEnd2EndYOLO(features: [VNCoreMLFeatureValueObservation],
+                                   confidenceThreshold: Float) -> [CGRect] {
+        let ml = MLLogger.shared
+        ml.log("🔢 parseEnd2EndYOLO() — threshold=\(confidenceThreshold)")
+
+        // Szukaj pierwszego MultiArray w wynikach
+        guard let feature = features.first(where: { $0.featureValue.multiArrayValue != nil }),
+              let multiArray = feature.featureValue.multiArrayValue else {
+            ml.log("❌ Brak MultiArray w wynikach feature")
+            return []
+        }
+
+        let shape = multiArray.shape.map { $0.intValue }
+        ml.log("📐 MultiArray shape=\(shape), dataType=\(multiArray.dataType.rawValue)")
+
+        // Oczekiwany format: [1, 300, 6] lub [300, 6]
+        let numDetections: Int
+        let valuesPerDetection: Int
+
+        if shape.count == 3 {
+            // [1, 300, 6]
+            numDetections = shape[1]
+            valuesPerDetection = shape[2]
+        } else if shape.count == 2 {
+            // [300, 6]
+            numDetections = shape[0]
+            valuesPerDetection = shape[1]
+        } else {
+            ml.log("❌ Nieobsługiwany shape: \(shape) — oczekiwano [1,N,6] lub [N,6]")
+            return []
+        }
+
+        ml.log("📊 numDetections=\(numDetections), valuesPerDetection=\(valuesPerDetection)")
+
+        guard valuesPerDetection >= 5 else {
+            ml.log("❌ Za mało wartości na detekcję: \(valuesPerDetection) < 5")
+            return []
+        }
+
+        let ptr = multiArray.dataPointer.bindMemory(to: Float.self, capacity: numDetections * valuesPerDetection)
+        let modelSize: Float = 640.0
+        var boxes: [CGRect] = []
+
+        // Loguj pierwsze kilka raw detekcji dla debugowania
+        let logLimit = min(numDetections, 10)
+        for i in 0..<logLimit {
+            let base = i * valuesPerDetection
+            let vals = (0..<valuesPerDetection).map { ptr[base + $0] }
+            let valsStr = vals.map { String(format: "%.2f", $0) }.joined(separator: ", ")
+            ml.log("   raw[\(i)] = [\(valsStr)]")
+        }
+        if numDetections > logLimit {
+            ml.log("   ... (\(numDetections - logLimit) więcej)")
+        }
+
+        var aboveThreshold = 0
+        for i in 0..<numDetections {
+            let base = i * valuesPerDetection
+            let x1   = ptr[base + 0]
+            let y1   = ptr[base + 1]
+            let x2   = ptr[base + 2]
+            let y2   = ptr[base + 3]
+            let conf = ptr[base + 4]
+
+            if conf > 0.01 { aboveThreshold += 1 }
+            guard conf >= confidenceThreshold else { continue }
+            guard x2 > x1, y2 > y1 else {
+                ml.log("   ⚠️ Pominięto detekcję [\(i)]: x2(\(x2)) <= x1(\(x1)) lub y2(\(y2)) <= y1(\(y1))")
+                continue
+            }
+
+            // Konwersja z pikseli modelu (0-640) → normalized Vision coords (0-1, bottom-left origin)
+            let nx = CGFloat(x1 / modelSize)
+            let ny = CGFloat(1.0 - y2 / modelSize)  // flip Y: Vision origin = bottom-left
+            let nw = CGFloat((x2 - x1) / modelSize)
+            let nh = CGFloat((y2 - y1) / modelSize)
+
+            let box = CGRect(x: nx, y: ny, width: nw, height: nh)
+            ml.log("   ✅ box[\(boxes.count)]: conf=\(String(format: "%.3f", conf)), pixel=(\(String(format: "%.0f", x1)),\(String(format: "%.0f", y1)))-(\(String(format: "%.0f", x2)),\(String(format: "%.0f", y2))), norm=\(box)")
+            boxes.append(box)
+        }
+
+        ml.log("📊 Podsumowanie: \(aboveThreshold) z conf>0.01, \(boxes.count) z conf>=\(confidenceThreshold)")
+        return boxes
     }
 
     /// Wspólna metoda: wycina regiony z CGImage i puszcza OCR na każdym wycinku
+    /// Synchroniczna — wywołuje completion na bieżącym wątku.
     private func ocrCroppedRegions(cgImage: CGImage, boxes: [CGRect],
                                     completion: @escaping ([(String, Double)], [CGRect]) -> Void) {
+        let ml = MLLogger.shared
         let imgW = CGFloat(cgImage.width)
         let imgH = CGFloat(cgImage.height)
-        let textsLock = NSLock()
         var allTexts: [(String, Double)] = []
-        let group = DispatchGroup()
+        ml.log("✂️ ocrCroppedRegions() — \(boxes.count) boxów, obraz \(Int(imgW))×\(Int(imgH))")
 
-        for box in boxes {
-            group.enter()
+        for (idx, box) in boxes.enumerated() {
             // Vision: origin bottomLeft, normalized → CGImage: origin topLeft
             let cropRect = CGRect(
                 x: box.origin.x * imgW,
@@ -1309,15 +1812,42 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 height: box.height * imgH
             ).integral
 
-            // Padding 10% dla lepszego OCR
-            let padX = cropRect.width * 0.1, padY = cropRect.height * 0.1
+            // Aggressive padding — YOLO boxes are very tight, OCR needs context
+            let minPadY: CGFloat = 30  // minimum 30px vertical padding
+            let minPadX: CGFloat = 20  // minimum 20px horizontal padding
+            let padX = max(cropRect.width * 0.4, minPadX)
+            let padY = max(cropRect.height * 1.0, minPadY)  // double the height as padding
             let paddedRect = cropRect.insetBy(dx: -padX, dy: -padY)
                 .intersection(CGRect(x: 0, y: 0, width: imgW, height: imgH))
 
+            ml.log("   box[\(idx)] raw=\(Int(cropRect.origin.x)),\(Int(cropRect.origin.y)) \(Int(cropRect.width))×\(Int(cropRect.height)) → padded=\(Int(paddedRect.width))×\(Int(paddedRect.height))")
+
             guard paddedRect.width > 0, paddedRect.height > 0,
                   let croppedCG = cgImage.cropping(to: paddedRect) else {
-                group.leave()
+                ml.log("   ⚠️ box[\(idx)] — nie udało się wyciąć regionu")
                 continue
+            }
+
+            // Upscale small crops for better OCR — minimum 150px height
+            let minOCRHeight: CGFloat = 150
+            let finalImage: CGImage
+            if CGFloat(croppedCG.height) < minOCRHeight {
+                let scale = minOCRHeight / CGFloat(croppedCG.height)
+                let newW = Int(CGFloat(croppedCG.width) * scale)
+                let newH = Int(minOCRHeight)
+                if let ctx = CGContext(data: nil, width: newW, height: newH,
+                                       bitsPerComponent: croppedCG.bitsPerComponent,
+                                       bytesPerRow: 0,
+                                       space: croppedCG.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                                       bitmapInfo: croppedCG.bitmapInfo.rawValue),
+                   let upscaled = (ctx.draw(croppedCG, in: CGRect(x: 0, y: 0, width: newW, height: newH)), ctx.makeImage()).1 {
+                    finalImage = upscaled
+                    ml.log("   box[\(idx)] upscaled \(croppedCG.width)×\(croppedCG.height) → \(newW)×\(newH)")
+                } else {
+                    finalImage = croppedCG
+                }
+            } else {
+                finalImage = croppedCG
             }
 
             let ocrReq = VNRecognizeTextRequest { req, _ in
@@ -1326,20 +1856,23 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                     guard let t = o.topCandidates(1).first else { return nil }
                     return (t.string, Double(t.confidence))
                 }
-                textsLock.lock()
+                if texts.isEmpty {
+                    ml.log("   box[\(idx)] OCR: brak tekstu")
+                } else {
+                    for (text, conf) in texts {
+                        ml.log("   box[\(idx)] OCR: \"\(text)\" (conf=\(String(format: "%.2f", conf)))")
+                    }
+                }
                 allTexts.append(contentsOf: texts)
-                textsLock.unlock()
-                group.leave()
             }
-            ocrReq.recognitionLevel = .fast
+            ocrReq.recognitionLevel = .accurate
             ocrReq.usesLanguageCorrection = false
             ocrReq.recognitionLanguages = ["en-US"]
-            try? VNImageRequestHandler(cgImage: croppedCG, orientation: .up).perform([ocrReq])
+            try? VNImageRequestHandler(cgImage: finalImage, orientation: .up).perform([ocrReq])
         }
 
-        group.notify(queue: ocrQ) {
-            completion(allTexts, boxes)
-        }
+        ml.log("📝 ocrCroppedRegions() zakończone — łącznie \(allTexts.count) tekstów")
+        completion(allTexts, boxes)
     }
 }
 
@@ -2124,6 +2657,7 @@ struct PlateForm: View {
 struct SettingsTab: View {
     @ObservedObject var engine: CameraEngine
     @ObservedObject var webServer: WebServer
+    @ObservedObject private var mlLogger = MLLogger.shared
 
     var body: some View {
         NavigationStack {
@@ -2275,6 +2809,18 @@ struct SettingsTab: View {
                         } header: { Text("Obiektyw") }
                     }
 
+                    // ── Rozdzielczość kamery ─────────────────────────────
+                    if engine.cameraSource == .iphone {
+                        Section {
+                            Picker("Rozdzielczość", selection: $engine.cameraResolution) {
+                                ForEach(CameraResolution.allCases) { Text($0.label).tag($0) }
+                            }.pickerStyle(.segmented)
+                            Text(engine.cameraResolution.description)
+                                .font(.system(size: 12))
+                                .foregroundStyle(engine.cameraResolution == .hd720p ? GV.muted : GV.azure)
+                        } header: { Text("Rozdzielczość kamery") }
+                    }
+
                     // ── Głosowanie ───────────────────────────────────────
                     Section("Głosowanie") {
                         Stepper("Min. powtórzeń: \(engine.minVotes)",value:$engine.minVotes,in:1...10)
@@ -2299,6 +2845,25 @@ struct SettingsTab: View {
                         LabeledContent("Adres web",value:webServer.isRunning ? "http://\(webServer.localIP):6600":"—")
                     }
 
+                    // ── Logowanie ML ─────────────────────────────────────
+                    Section {
+                        Toggle(isOn: $mlLogger.isEnabled) {
+                            Label("Zbieranie logów ML", systemImage: "brain")
+                        }
+                        .tint(GV.purple)
+                        Text("Włącz szczegółowe logi pipeline'u YOLO ML do debugowania detekcji tablic.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(GV.muted)
+
+                        if !mlLogger.entries.isEmpty {
+                            Button(role: .destructive) {
+                                mlLogger.clear()
+                            } label: {
+                                Label("Wyczyść logi ML (\(mlLogger.entries.count))", systemImage: "trash")
+                            }
+                        }
+                    } header: { Text("Logowanie ML") }
+
                     // ── Debug ────────────────────────────────────────────
                     Section {
                         NavigationLink {
@@ -2316,6 +2881,24 @@ struct SettingsTab: View {
                             engine.liveLog.removeAll()
                         } label: { Label("Wyczyść logi",systemImage:"trash") }
                     }
+
+                    // ── Aplikacja ────────────────────────────────────────
+                    Section {
+                        LabeledContent("Wersja", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—")
+                        LabeledContent("Build", value: Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—")
+                        Link(destination: URL(string: "https://github.com/mrfroncu/Gatevision-iOS")!) {
+                            HStack {
+                                Label("GitHub", systemImage: "link")
+                                Spacer()
+                                Text("mrfroncu/Gatevision-iOS")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(GV.muted)
+                                Image(systemName: "arrow.up.right.square")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(GV.muted)
+                            }
+                        }
+                    } header: { Text("Aplikacja") }
                 }.scrollContentBackground(.hidden)
             }
             .navigationTitle("Ustawienia")
@@ -2355,7 +2938,7 @@ struct DebugTab: View {
                     LabeledContent("OCR FPS",value:String(format:"%.2f",engine.ocrFPS))
                     LabeledContent("Silnik",value:"Apple Vision (.fast)")
                     LabeledContent("Język OCR",value:"en-US")
-                    LabeledContent("Rozdzielczość",value:"1280 × 720")
+                    LabeledContent("Rozdzielczość",value:engine.cameraResolution.displaySize)
                     LabeledContent("Wykryte boxy",value:"\(engine.detectedBoxes.count)")
                 } header: { Text("Diagnostyka OCR") }
 
@@ -2387,6 +2970,22 @@ struct DebugTab: View {
                     LabeledContent("Min. głosów",value:"\(engine.minVotes)")
                     LabeledContent("Okno głosowania",value:"\(engine.voteWindowSize) klatek")
                 } header: { Text("Brama") }
+
+                // ── Logi ML ──────────────────────────────────────────────
+                Section {
+                    NavigationLink {
+                        MLLogView()
+                    } label: {
+                        HStack {
+                            Label("Logi YOLO ML", systemImage: "brain")
+                                .foregroundStyle(GV.purple)
+                            Spacer()
+                            Text("\(MLLogger.shared.entries.count)")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(GV.muted)
+                        }
+                    }
+                } header: { Text("Logi ML") }
 
                 // ── Głosowanie — test ────────────────────────────────────
                 Section {
@@ -2424,3 +3023,170 @@ struct DebugTab: View {
         .preferredColorScheme(.dark)
     }
 }
+// MARK: ─── ML Log View ───────────────────────────────────────────────────────
+
+struct MLLogView: View {
+    @ObservedObject private var logger = MLLogger.shared
+    @State private var autoScroll = true
+    @State private var copied = false
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [GV.bgTop, GV.bgBottom], startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                // Pasek statusu
+                HStack(spacing: 12) {
+                    // Stan logowania
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(logger.isEnabled ? GV.lime : GV.red)
+                            .frame(width: 8, height: 8)
+                        Text(logger.isEnabled ? "Zbieranie aktywne" : "Zbieranie wyłączone")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundStyle(logger.isEnabled ? GV.lime : GV.red)
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background((logger.isEnabled ? GV.lime : GV.red).opacity(0.1))
+                    .clipShape(Capsule())
+
+                    Spacer()
+
+                    Text("\(logger.entries.count) wpisów")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(GV.muted)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 8)
+
+                // Logi
+                if logger.entries.isEmpty {
+                    Spacer()
+                    VStack(spacing: 12) {
+                        Image(systemName: "brain")
+                            .font(.system(size: 40))
+                            .foregroundStyle(GV.muted.opacity(0.4))
+                        Text("Brak logów ML")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(GV.muted)
+                        if !logger.isEnabled {
+                            Text("Włącz zbieranie logów w Ustawieniach → Logowanie ML")
+                                .font(.system(size: 12))
+                                .foregroundStyle(GV.muted.opacity(0.6))
+                                .multilineTextAlignment(.center)
+                        } else {
+                            Text("Logi pojawią się gdy pipeline YOLO ML przetworzy klatki.\nUpewnij się, że tryb detekcji to \"YOLO ML\".")
+                                .font(.system(size: 12))
+                                .foregroundStyle(GV.muted.opacity(0.6))
+                                .multilineTextAlignment(.center)
+                        }
+                    }
+                    .padding(32)
+                    Spacer()
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 1) {
+                                ForEach(Array(logger.entries.enumerated()), id: \.offset) { idx, entry in
+                                    Text(entry)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundStyle(mlLogColor(for: entry))
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 1)
+                                        .id(idx)
+                                }
+                            }
+                            .padding(.vertical, 8)
+                        }
+                        .onChange(of: logger.entries.count) { _, _ in
+                            if autoScroll, let last = logger.entries.indices.last {
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    proxy.scrollTo(last, anchor: .bottom)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Dolny pasek z przyciskami
+                HStack(spacing: 12) {
+                    // Toggle logowania
+                    Button {
+                        logger.isEnabled.toggle()
+                    } label: {
+                        Label(logger.isEnabled ? "Wstrzymaj" : "Włącz",
+                              systemImage: logger.isEnabled ? "pause.fill" : "play.fill")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(logger.isEnabled ? GV.orange : GV.lime)
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .background((logger.isEnabled ? GV.orange : GV.lime).opacity(0.1))
+                            .overlay(Capsule().strokeBorder((logger.isEnabled ? GV.orange : GV.lime).opacity(0.3), lineWidth: 1))
+                            .clipShape(Capsule())
+                    }
+
+                    // Auto-scroll toggle
+                    Button {
+                        autoScroll.toggle()
+                    } label: {
+                        Label(autoScroll ? "Auto-scroll" : "Ręczne",
+                              systemImage: autoScroll ? "arrow.down.to.line" : "hand.raised")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(GV.azure)
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .background(GV.azure.opacity(0.1))
+                            .overlay(Capsule().strokeBorder(GV.azure.opacity(0.3), lineWidth: 1))
+                            .clipShape(Capsule())
+                    }
+
+                    Spacer()
+
+                    // Copy
+                    Button {
+                        UIPasteboard.general.string = logger.fullText
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+                    } label: {
+                        Label(copied ? "Skopiowano!" : "Kopiuj",
+                              systemImage: copied ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(copied ? GV.lime : GV.fg)
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .background((copied ? GV.lime : Color.white).opacity(0.1))
+                            .overlay(Capsule().strokeBorder((copied ? GV.lime : Color.white).opacity(0.3), lineWidth: 1))
+                            .clipShape(Capsule())
+                    }
+                    .disabled(logger.entries.isEmpty)
+
+                    // Clear
+                    Button {
+                        logger.clear()
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(GV.red)
+                            .padding(8)
+                            .background(GV.red.opacity(0.1))
+                            .clipShape(Circle())
+                    }
+                    .disabled(logger.entries.isEmpty)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                .background(.ultraThinMaterial)
+            }
+        }
+        .navigationTitle("Logi YOLO ML")
+        .navigationBarTitleDisplayMode(.inline)
+        .preferredColorScheme(.dark)
+    }
+
+    private func mlLogColor(for entry: String) -> Color {
+        if entry.contains("❌") { return GV.red }
+        if entry.contains("⚠️") { return GV.orange }
+        if entry.contains("✅") { return GV.lime }
+        if entry.contains("📷") || entry.contains("🔍") { return GV.azure }
+        if entry.contains("🧠") || entry.contains("⏱️") { return GV.purple }
+        return GV.fg.opacity(0.7)
+    }
+}
+
